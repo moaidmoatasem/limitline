@@ -226,7 +226,17 @@ check(c.alerts_quiet(dict(cfg, quiet_enabled=True), lt) and not c.alerts_quiet(d
 check(c.alerts_quiet(dict(cfg, snooze_until=lt + 60), lt) and not c.alerts_quiet(dict(cfg, snooze_until=lt - 1), lt), "snooze works and expires")
 check(c.mascot_mood({"kind": "threshold", "pct": 92}) == "alarmed" and c.mascot_mood({"kind": "reset", "pct": 0}) == "joy", "mascot mood follows the level")
 check(all(len(c.mascot_shapes(i, m, "#d4a24c", "#1a1a1a", 60)) > 8 for i in (0, 5) for m in ("happy", "calm", "worried", "alarmed", "out", "joy")), "mascot frames build for every mood")
-check(__import__("re").search(r'version = "(\d+\.\d+)', open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pyproject.toml")).read()).group(1) == c.VERSION, "pyproject version matches the app version")
+
+# ---- status-line repair
+cmd0 = c.statusline_command("echo mine")
+check(c._chain_of(cmd0) == "echo mine", "chain is recovered from our own command")
+cfgdir = __import__("tempfile").mkdtemp(); os.environ["CLAUDE_CONFIG_DIR"] = cfgdir; sp = os.path.join(cfgdir, "settings.json")
+json.dump({"statusLine": {"type": "command", "command": "pythonw.exe old.py --statusline --then 'echo mine'"}}, open(sp, "w"))
+ok, msg = c.install_statusline(cfgdir)
+fixed = json.load(open(sp))["statusLine"]["command"]
+check(ok and "repaired" in msg and "pythonw" not in fixed and fixed.endswith("echo mine'") or fixed.endswith('echo mine"'), f"stale connection is repaired and keeps the chain ({fixed})")
+check(c.install_statusline(cfgdir)[1] == "Already connected.", "repaired connection is stable")
+check(__import__("re").search(r'version = "(\d+\.\d+\.\d+)', open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pyproject.toml")).read()).group(1) == c.VERSION, "pyproject version matches the app version")
 print("\nFAILURES:", fails if fails else "none")
 
 # ---- official status-line bridge ----------------------------------------------
@@ -267,5 +277,5 @@ c.install_statusline(cfgdir); c.uninstall_statusline()
 check(json.load(open(sp)) == {"theme": "dark"}, "uninstall removes our entry when there was none before")
 open(sp, "w").write("{not json")
 check(c.install_statusline(cfgdir)[0] is False and open(sp).read() == "{not json", "unreadable settings are left untouched")
-check(__import__("re").search(r'version = "(\d+\.\d+)', open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pyproject.toml")).read()).group(1) == c.VERSION, "pyproject version matches the app version")
+check(__import__("re").search(r'version = "(\d+\.\d+\.\d+)', open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pyproject.toml")).read()).group(1) == c.VERSION, "pyproject version matches the app version")
 print("\nFAILURES:", fails if fails else "none")

@@ -1,5 +1,8 @@
 # Changelog
 
+## 2.3.1
+- Fix: live limits never arrived on some Windows setups. The status line could be registered with `pythonw.exe` (no stdin/stdout, so Claude Code got nothing); it now always uses `python.exe` and forward-slash paths, and Connect repairs a stale registration in place. Problems are noted in `.limitline-statusline-note.txt`.
+
 ## 2.3
 - **Alerts upgraded:** separate levels for the 5-hour window and weekly limits, optional "every N%" steps (25 → 50 → 75 → 100), a pace warning ("at this pace you'll run out at 15:40"), quiet hours, snooze from the right-click menu, optional sound. During quiet hours or a snooze the banner still shows; flash, sound, notification and mascot stay silent.
 - **Mascot "Tick":** an original animated gauge character appears beside the widget when an alert fires, with a mood for each level (calm → worried → alarmed → out, joyful on reset). Off / Subtle / Every alert; stops animating when the OS asks to reduce motion; click to dismiss.

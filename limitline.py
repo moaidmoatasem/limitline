@@ -82,7 +82,7 @@ except ImportError:  # pragma: no cover - reported in main()
 _Canvas = tk.Canvas if tk else object
 
 APP_NAME = "Limitline"
-VERSION = "2.3"
+VERSION = "2.3.1"
 IS_WIN = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
 HOME = os.path.expanduser("~")
@@ -779,8 +779,20 @@ def _shell_join(parts):
     return subprocess.list2cmdline(parts) if IS_WIN else " ".join(shlex.quote(x) for x in parts)
 
 
+def _status_python():
+    """The interpreter for the status line. Never pythonw.exe: it has no stdin/stdout, so Claude Code would get nothing."""
+    exe = sys.executable
+    if IS_WIN:
+        d, name = os.path.split(exe)
+        if name.lower() == "pythonw.exe" and os.path.exists(os.path.join(d, "python.exe")):
+            exe = os.path.join(d, "python.exe")
+        exe = exe.replace("\\", "/")     # forward slashes survive both cmd.exe and Git Bash
+    return exe
+
+
 def statusline_command(chain=None, config_dir=None):
-    parts = [sys.executable, os.path.abspath(__file__), "--statusline"]
+    script = os.path.abspath(__file__)
+    parts = [_status_python(), script.replace("\\", "/") if IS_WIN else script, "--statusline"]
     if config_dir:
         parts += ["--config-dir", config_dir]
     if chain:
@@ -790,7 +802,10 @@ def statusline_command(chain=None, config_dir=None):
 
 def run_statusline(chain=None):
     """Claude Code status-line command: save rate_limits, print one short line (or the chained command's)."""
-    raw = sys.stdin.read()
+    try:
+        raw = sys.stdin.read() if sys.stdin else ""
+    except (OSError, ValueError):
+        raw = ""
     try:
         d = json.loads(raw)
     except ValueError:
@@ -798,8 +813,11 @@ def run_statusline(chain=None):
     if isinstance(d, dict) and isinstance(d.get("rate_limits"), dict):
         try:
             _write_json_atomic(live_file_path(), {"ts": time.time(), "rate_limits": d["rate_limits"]})
-        except OSError:
-            pass
+        except OSError as ex:
+            _statusline_note(f"could not write {live_file_path()}: {ex}")
+    elif raw.strip():
+        _statusline_note("Claude Code sent no rate_limits (needs a Pro/Max login and a first reply; "
+                         "keys received: %s)" % (sorted(d)[:12] if isinstance(d, dict) else "unreadable input"))
     out = ""
     if chain:
         try:
@@ -815,7 +833,30 @@ def run_statusline(chain=None):
             if isinstance(v, (int, float)):
                 bits.append(f"{tag} {v:.0f}%")
         out = " · ".join(bits)
-    sys.stdout.write(out)
+    if sys.stdout:
+        sys.stdout.write(out)
+
+
+def _statusline_note(text):
+    """Last status-line problem, for 'why is there no live data?' (kept next to the config)."""
+    try:
+        with open(os.path.join(os.path.dirname(CONFIG_PATH), ".limitline-statusline-note.txt"), "w", encoding="utf-8") as fh:
+            fh.write(time.strftime("%Y-%m-%d %H:%M:%S ") + text + "\n")
+    except OSError:
+        pass
+
+
+def _chain_of(cmd):
+    """The original status line we wrapped, taken back out of our own command."""
+    i = cmd.find(" --then ")
+    if i < 0:
+        return None
+    rest = cmd[i + 8:].strip()
+    if rest.startswith('"') and rest.endswith('"') and len(rest) > 1:
+        rest = rest[1:-1].replace('\\"', '"')
+    elif rest.startswith("'") and rest.endswith("'") and len(rest) > 1:
+        rest = rest[1:-1].replace("'\"'\"'", "'")
+    return rest or None
 
 
 def install_statusline(config_dir=None):
@@ -832,7 +873,16 @@ def install_statusline(config_dir=None):
         return False, f"Couldn't read {sp}; left untouched."
     cur = data.get("statusLine")
     if isinstance(cur, dict) and "--statusline" in str(cur.get("command", "")):
-        return True, "Already connected."
+        old = str(cur.get("command", ""))
+        fresh = statusline_command(_chain_of(old), config_dir)
+        if old == fresh:
+            return True, "Already connected."
+        try:                      # same app, but a stale path/interpreter (e.g. pythonw): repair in place
+            data["statusLine"] = dict(cur, type="command", command=fresh)
+            _write_json_atomic(sp, data)
+        except OSError as ex:
+            return False, f"Couldn't write {sp}: {ex}"
+        return True, "Connection repaired. Limits appear after your next message in Claude Code."
     chain = cur.get("command") if isinstance(cur, dict) and cur.get("type") == "command" else None
     try:
         if not os.path.exists(_backup_path()):
