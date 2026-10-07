@@ -1,6 +1,7 @@
 # Changelog
 
 ## 2.2
+- **Easier setup:** first-run welcome window (history found, one-click Connect, start with computer); a Connect button right on the limits card; `install.bat` / `install.sh` that install Python if needed, add a launcher, connect, autostart and launch, with clean `--uninstall`; `pip` / `pipx` install (`limitline`, `limitline-gui`); `--setup`, `--autostart on|off`.
 - **Renamed to Limitline** (neutral name, "unofficial" notice) to follow Anthropic's trademark rules. Settings migrate from `~/.claude-usage-popup.json`; hook variables are now `LIMITLINE_EVENT/LABEL/PCT`; if you connected the old build's status line, run `--install-statusline` again.
 - `--selftest`: end-to-end check of a computer (window rendering, DPI, fonts, status-line with shell quoting, startup entry, notification).
 - Settings window scrolls on short screens, with Save/Cancel pinned.

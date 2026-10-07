@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "limitline"
+version = "2.2.0"
+description = "Floating desktop monitor for Claude Code usage and plan limits (unofficial)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+keywords = ["claude", "claude-code", "usage", "monitor", "tkinter"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Environment :: X11 Applications",
+  "Topic :: Utilities",
+]
+
+[project.scripts]
+limitline = "limitline:main"
+
+[project.gui-scripts]
+limitline-gui = "limitline:main"
+
+[tool.setuptools]
+py-modules = ["limitline"]

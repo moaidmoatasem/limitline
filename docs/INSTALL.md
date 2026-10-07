@@ -1,52 +1,32 @@
 # Installation
 
-## Requirements
-- Python 3.8 or newer **with tkinter**
-  - Windows / macOS (python.org installer): included.
-  - Debian/Ubuntu: `sudo apt install python3-tk`
-  - Fedora: `sudo dnf install python3-tkinter`
-  - macOS with Homebrew Python: `brew install python-tk`
-- Claude Code used on this computer (so there are logs to read). For live plan limits, be logged in to Claude Code.
+## Fastest
+- **Windows:** double-click `install.bat` (or `powershell -ExecutionPolicy Bypass -File scripts\install.ps1`). Options: `-NoAutostart`, `-NoLaunch`, `-Desktop` (desktop shortcut), `-Uninstall`.
+- **macOS / Linux:** `./scripts/install.sh` (options `--no-autostart`, `--no-launch`, `--uninstall`).
+- **pipx / pip:** `pipx install git+https://github.com/<you>/limitline`, then `limitline` (GUI without a console on Windows: `limitline-gui`).
 
-## Just run it
-```bash
-git clone https://github.com/<you>/limitline.git
-cd limitline
-python limitline.py
-```
+The installers: make sure Python 3.8+ with tkinter exists (Windows installs it with winget if missing), copy the app to a permanent folder, add a launcher, connect live limits through Claude Code's status line (your existing one keeps working), turn on launch at login, and start the app. All per-user, no admin rights.
 
-## Install a launcher
-
-### macOS / Linux
-```bash
-./scripts/install.sh
-limitline            # add ~/.local/bin to PATH if needed
-```
-Copies the app to `~/.local/share/limitline`, creates `~/.local/bin/limitline` and, on Linux, an application-menu entry. Remove with `./scripts/install.sh --uninstall`.
-
-### Windows
+One-liners once the repo is public (replace `<you>`):
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+irm https://raw.githubusercontent.com/<you>/limitline/main/scripts/install.ps1 | iex
 ```
-Copies the app to `%LOCALAPPDATA%\Limitline` and adds a Start-menu shortcut that uses `pythonw` (no console window). Remove with `-Uninstall`.
-
-## Check your install
 ```bash
-python limitline.py --selftest
+curl -fsSL https://raw.githubusercontent.com/<you>/limitline/main/scripts/install.sh | bash
 ```
-Windows users: also follow [WINDOWS_TEST.md](WINDOWS_TEST.md).
+Read a script before piping it to a shell.
 
-## Connect live limits (recommended)
-```bash
-python limitline.py --install-statusline     # or Settings > Connect
-```
-This sets Claude Code's `statusLine` to call this app, keeping any existing status line running, and backs up what was there. Undo any time with `--uninstall-statusline`. Then send one message in Claude Code and the limits appear.
+## Requirements
+Python 3.8+ with tkinter. Windows/macOS python.org installers include it. Debian/Ubuntu `sudo apt install python3-tk`; Fedora `sudo dnf install python3-tkinter`; Homebrew `brew install python-tk`.
 
-## Start at login
-Open the app, press `S`, switch on **Launch at login**. It writes a startup entry (Windows: a `.vbs` in the Startup folder, macOS: a LaunchAgent, Linux: an autostart `.desktop` file) pointing at the script's current location, and removes it when switched off. Install the app to a permanent folder first (see above) so the entry doesn't break if you move the repo.
+## First run
+The welcome window offers three buttons: see which Claude Code history was found, **Connect** live limits, and start with your computer. Reopen it any time with `limitline --setup`. Everything else is in Settings (press `S`).
 
-## Second account
-```bash
-python limitline.py --config-dir ~/.claude-work
-```
-Uses that folder's logs and login, a separate settings file, and may run alongside the main copy.
+## Manual steps (if you prefer)
+- Live limits: `limitline --install-statusline` (undo `--uninstall-statusline`), then send a message in Claude Code.
+- Launch at login: `limitline --autostart on|off`.
+- Check this computer: `limitline --selftest` (Windows: also [WINDOWS_TEST.md](WINDOWS_TEST.md)).
+- Second account: `limitline --config-dir ~/.claude-work`.
+
+## Update
+Re-run the installer or `pipx upgrade limitline`. Settings are kept.

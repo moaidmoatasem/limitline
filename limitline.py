@@ -113,6 +113,7 @@ DEFAULTS = {
     "alert_levels": [75, 90],
     "desktop_notify": True,
     "notify_reset": True,
+    "welcomed": False,          # first-run welcome window has been shown
     "live_limits": True,
     "live_oauth": False,        # advanced, off by default: ask Anthropic using Claude Code's saved login
     "live_interval_sec": 120,
@@ -842,6 +843,15 @@ def uninstall_statusline():
     return True, "Restored your previous status line."
 
 
+def statusline_connected():
+    try:
+        with open(claude_settings_path(), encoding="utf-8") as fh:
+            cmd = (json.load(fh).get("statusLine") or {}).get("command", "")
+        return "--statusline" in str(cmd)
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def read_bridge(now=None):
     """-> (items, written_at) from the status-line file, or None. Expired windows are dropped."""
     now = now or time.time()
@@ -958,7 +968,7 @@ class LiveLimits:
             if b is not None:
                 return {"status": "wait", "msg": "Waiting for Claude Code to report your limits (after your next message)."}
             return {"status": "nobridge",
-                    "msg": "Not connected yet. Open Settings and choose Connect Claude Code."}
+                    "msg": "Not connected yet. One click, no login access needed:"}
         return self.fetch_oauth()
 
     def fetch_oauth(self):
@@ -1860,6 +1870,8 @@ class App:
         root.after(120, self.poll)
         if getattr(args, "open_settings", False):
             root.after(600, self.open_settings)
+        elif getattr(args, "setup", False) or (not args.demo and not cfg.get("welcomed")):
+            root.after(900, self.open_welcome)
 
     # ---------------------------------------------------------------- basics
     def px(self, n):
@@ -2744,6 +2756,8 @@ class App:
             self.lbl(body, msg, "small", "muted", justify="left", wraplength=self.CW).pack(anchor="w")
             if st not in ("idle",):
                 self.lbl(body, "Showing estimates from your local logs instead.", "tiny", "muted").pack(anchor="w", pady=(px(2), 0))
+            if st == "nobridge":
+                self.button(body, "Connect Claude Code", self.connect_statusline, primary=True).pack(anchor="w", pady=(px(10), 0))
 
     def render_kpis(self, s):
         th, px, metric = self.th, self.px, s["metric"]
@@ -3078,6 +3092,19 @@ class App:
     def open_logs(self):
         roots = (self.snap or {}).get("scan", {}).get("roots") or log_roots(self.cfg.get("extra_paths"))
         open_path(roots[0] if roots else HOME)
+
+    def open_welcome(self):
+        if getattr(self, "welcome", None) and self.welcome.win.winfo_exists():
+            self.welcome.win.lift()
+            return
+        self.welcome = Welcome(self)
+
+    def connect_statusline(self):
+        ok, msg = install_statusline(self.args.config_dir)
+        self.toast = (msg, time.time() + 9)
+        self.update_footer()
+        self.live.wake.set()
+        return ok, msg
 
     def open_settings(self):
         if self.settings and self.settings.win.winfo_exists():
@@ -3527,10 +3554,7 @@ class SettingsDialog:
 
         def connect(parent):
             def go():
-                ok, msg = install_statusline(app.args.config_dir)
-                app.toast = (msg, time.time() + 9)
-                app.update_footer()
-                app.live.wake.set()
+                app.connect_statusline()
             return app.button(parent, "Connect", go)
         self.row(box, "Connect Claude Code", connect,
                  "Adds a status-line command to Claude Code's settings. Backed up and reversible.")
@@ -3613,6 +3637,95 @@ class SettingsDialog:
 # =============================================================================
 # main
 # =============================================================================
+class Welcome:
+    """First-run window: three one-click steps."""
+
+    def __init__(self, app):
+        self.app, self.msg = app, ""
+        th = app.th
+        self.win = tk.Toplevel(app.root)
+        self.win.title(f"Welcome · {APP_NAME}")
+        self.win.configure(bg=th["bg"])
+        self.win.resizable(False, False)
+        try:
+            self.win.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        self.body = tk.Frame(self.win, bg=th["bg"])
+        self.body.pack(padx=app.px(18), pady=app.px(16))
+        self.auto = autostart_enabled()
+        self.build()
+        self.win.update_idletasks()
+        w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
+        x0, y0, x1, y1 = app.screen_bounds()
+        rx, ry = app.root.winfo_x(), app.root.winfo_y()
+        x = rx - w - app.px(12) if rx - w - app.px(12) > x0 else min(x1 - w - app.px(12), rx + app.px(40))
+        self.win.geometry(f"+{int(x)}+{int(max(y0 + app.px(20), min(ry + app.px(30), y1 - h - app.px(60))))}")
+        self.win.protocol("WM_DELETE_WINDOW", self.done)
+        self.win.bind("<Escape>", lambda e: self.done())
+        self.win.focus_force()
+
+    def step(self, num, title, desc, make=None):
+        app, th, f, px = self.app, self.app.th, self.app.f, self.app.px
+        body, _ = app.card(self.body)
+        left = tk.Frame(body, bg=th["surface"])
+        left.pack(side="left", fill="x", expand=True)
+        tk.Label(left, text=f"{num}  {title}", font=f["bodyb"], fg=th["ink"], bg=th["surface"], anchor="w").pack(anchor="w")
+        tk.Label(left, text=desc, font=f["small"], fg=th["muted"], bg=th["surface"], anchor="w", justify="left",
+                 wraplength=px(270)).pack(anchor="w", pady=(px(3), 0))
+        if make:
+            make(body).pack(side="right", padx=(px(10), 0))
+
+    def build(self):
+        app, th, f, px = self.app, self.app.th, self.app.f, self.app.px
+        for w in self.body.winfo_children():
+            w.destroy()
+        tk.Label(self.body, text=f"Welcome to {APP_NAME}", font=f["h1"], fg=th["ink"], bg=th["bg"]).pack(anchor="w")
+        tk.Label(self.body, text="Three quick things. Everything can be changed later in Settings (press S).",
+                 font=f["small"], fg=th["muted"], bg=th["bg"]).pack(anchor="w", pady=(px(3), px(12)))
+        roots = log_roots(app.cfg.get("extra_paths") or [])
+        if roots:
+            self.step("1", "Your Claude Code history", "Found " + ", ".join(shorten_path(r) for r in roots[:2]) + ".")
+        else:
+            self.step("1", "Your Claude Code history",
+                      "No log folder yet. Use Claude Code once and it appears; you can also add a folder in Settings.")
+        if statusline_connected():
+            self.step("2", "Live plan limits", "Connected. Your real 5-hour and weekly limits show after your next "
+                      "message in Claude Code.", lambda p: tk.Label(p, text="Connected", font=f["smallb"],
+                                                                      fg=STATUS["good"], bg=th["surface"]))
+        else:
+            def connect(parent):
+                def go():
+                    ok, self.msg = app.connect_statusline()
+                    self.build()
+                return app.button(parent, "Connect", go, primary=True)
+            self.step("2", "Live plan limits", "Uses Claude Code's official status line. No login access. "
+                      "Your current status line keeps working, and you can undo it anytime.", connect)
+        if self.msg:
+            tk.Label(self.body, text=self.msg, font=f["tiny"], fg=th["ink2"], bg=th["bg"], wraplength=px(340),
+                     justify="left").pack(anchor="w", pady=(0, px(6)))
+
+        def switch(parent):
+            return Switch(parent, app, self.auto, self.set_auto)
+        self.step("3", "Start with your computer", "Opens Limitline when you sign in.", switch)
+        foot = tk.Frame(self.body, bg=th["bg"])
+        foot.pack(fill="x", pady=(px(4), 0))
+        app.button(foot, "Done", self.done, primary=True).pack(side="right")
+
+    def set_auto(self, on):
+        self.auto = bool(on)
+        set_autostart(self.auto)
+
+    def done(self):
+        self.app.cfg["welcomed"] = True
+        self.app.save_soon()
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+        self.app.live.wake.set()
+
+
 # =============================================================================
 # Self-test: run `python limitline.py --selftest` on any computer (esp. Windows)
 # =============================================================================
@@ -3787,6 +3900,14 @@ def run_selftest(args):
                     return h <= 728, f"settings is {h}px tall on a 728px screen" + (" (scrolls)" if scrolls else "")
                 check("settings fits a 1366x768 laptop", small_screen)
 
+                def welcome():
+                    app.open_welcome()
+                    root.update()
+                    ok = app.welcome.win.winfo_exists()
+                    app.welcome.win.destroy()
+                    return ok, ""
+                check("first-run welcome window", welcome)
+
                 def tweaks():
                     if IS_WIN:
                         app.win_tweaks()
@@ -3825,6 +3946,8 @@ def main():
     ap.add_argument("--multi", action="store_true", help="allow more than one copy")
     ap.add_argument("--config-dir", metavar="DIR",
                     help="watch another Claude account (its Claude config folder); implies --multi")
+    ap.add_argument("--setup", action="store_true", help="show the first-run welcome window")
+    ap.add_argument("--autostart", choices=["on", "off"], help="turn launch-at-login on or off, then exit")
     ap.add_argument("--selftest", action="store_true", help="check this computer end to end and save a report")
     ap.add_argument("--statusline", action="store_true",
                     help="run as Claude Code's status-line command (reads JSON on stdin)")
@@ -3845,6 +3968,10 @@ def main():
     if args.statusline:
         run_statusline(args.then)
         return
+    if args.autostart:
+        ok = set_autostart(args.autostart == "on")
+        print(f"Launch at login {'enabled' if args.autostart == 'on' else 'disabled'}." if ok else "Couldn't change the startup entry.")
+        sys.exit(0 if ok else 1)
     if args.selftest:
         sys.exit(run_selftest(args))
     if args.install_statusline or args.uninstall_statusline:

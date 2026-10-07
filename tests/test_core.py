@@ -197,6 +197,7 @@ with open(os.path.join(pj, "s.jsonl"), "w") as fh:
 st2 = c.LogStore(); st2.scan([os.path.join(tmp2, "projects")], 0)
 bill, logged_then = st2.cost_states["S9"]
 check(abs(logged_then - 0.02) < 1e-9 and bill == 0.0205, f"coverage snapshot compares like with like ({logged_then}, {bill})")
+check(__import__("re").search(r'version = "(\d+\.\d+)', open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pyproject.toml")).read()).group(1) == c.VERSION, "pyproject version matches the app version")
 print("\nFAILURES:", fails if fails else "none")
 
 # ---- official status-line bridge ----------------------------------------------
@@ -237,4 +238,5 @@ c.install_statusline(cfgdir); c.uninstall_statusline()
 check(json.load(open(sp)) == {"theme": "dark"}, "uninstall removes our entry when there was none before")
 open(sp, "w").write("{not json")
 check(c.install_statusline(cfgdir)[0] is False and open(sp).read() == "{not json", "unreadable settings are left untouched")
+check(__import__("re").search(r'version = "(\d+\.\d+)', open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pyproject.toml")).read()).group(1) == c.VERSION, "pyproject version matches the app version")
 print("\nFAILURES:", fails if fails else "none")

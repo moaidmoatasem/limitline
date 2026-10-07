@@ -22,18 +22,18 @@ One Python file. No dependencies beyond the standard library (tkinter). Windows,
 |---|---|
 | ![History](docs/img/history.png) | ![Sessions](docs/img/sessions.png) |
 
-## Quick start
+## Install (about a minute)
 
-Requires Python 3.8+ with tkinter.
+| You have | Do this |
+|---|---|
+| **Windows** | Download the repo, double-click **`install.bat`**. It installs Python 3.12 via winget if missing, adds a Start-menu shortcut, connects live limits, starts at login and launches. |
+| **macOS / Linux** | `./scripts/install.sh` (same steps; adds a `limitline` command). |
+| **Python already** | `pipx install git+https://github.com/<you>/limitline` (or `pip install`), then run `limitline`. |
+| **Just trying it** | `python limitline.py --demo` |
 
-```bash
-python limitline.py          # run it
-python limitline.py --demo   # preview with sample data
-```
+First launch shows a three-step welcome window (history found, **Connect** live limits, start with your computer). Nothing needs editing by hand. Check everything with `limitline --selftest`. Remove it with `install.bat -Uninstall` or `./scripts/install.sh --uninstall`; that also restores your previous status line.
 
-On Windows use `pythonw limitline.py` (or rename the file to `.pyw`) so no console window stays open.
-
-To install it as a launcher, see [docs/INSTALL.md](docs/INSTALL.md).
+Details: [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Controls
 
