@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Compile
-        run: python -m py_compile claude_usage_popup.py
+        run: python -m py_compile limitline.py
       - name: Core tests (no display needed)
         run: python tests/test_core.py
       - name: Self-test with a real window (Windows, macOS)
