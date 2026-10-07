@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.limitline.json
+*.tmp
+.DS_Store
+dist/
