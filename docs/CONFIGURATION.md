@@ -20,7 +20,16 @@ Edit in the app (`S`) or by hand in `~/.limitline.json` while the app is closed.
 | `live_oauth` | `false` | Advanced and risky: also use Claude Code's saved login token. See the README's Terms and risk section |
 | `live_interval_sec` | `120` | Base poll interval; adapts to activity and resets |
 | `alerts` | `true` | Enable alerts |
-| `alert_levels` | `[75, 90]` | Percent thresholds |
+| `alert_levels` | `[75, 90]` | Percent thresholds for the 5-hour window |
+| `alert_levels_week` | `[50, 75, 90]` | Thresholds for the weekly limits |
+| `alert_step` | `0` | Also alert every N% (e.g. `25` gives 25, 50, 75, 100). 0 or empty = off |
+| `alert_forecast` | `true` | Pace warning: you're on course to hit the limit before the window resets |
+| `quiet_enabled` | `false` | Quiet hours: banner only, no flash, sound, notification or mascot |
+| `quiet_from` / `quiet_to` | `"22:00"` / `"08:00"` | Quiet hours (24-hour, may wrap past midnight) |
+| `snooze_until` | `0` | Set from the right-click menu (Snooze alerts) |
+| `alert_sound` | `false` | System beep on alerts |
+| `mascot` | `"subtle"` | `off`, `subtle` (75%+, pace warnings, resets) or `full` (every alert) |
+| `mascot_animate` | `true` | Animate the mascot; off automatically when the OS reduces motion |
 | `alerts_pace_only` | `false` | Alert only when usage is ahead of the clock |
 | `desktop_notify` | `true` | OS notifications |
 | `notify_reset` | `true` | Notify when a nearly-full window resets |

@@ -82,7 +82,7 @@ except ImportError:  # pragma: no cover - reported in main()
 _Canvas = tk.Canvas if tk else object
 
 APP_NAME = "Limitline"
-VERSION = "2.2"
+VERSION = "2.3"
 IS_WIN = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
 HOME = os.path.expanduser("~")
@@ -110,7 +110,17 @@ DEFAULTS = {
     "refresh_sec": 15,
     "history_days": 30,
     "alerts": True,
-    "alert_levels": [75, 90],
+    "alert_levels": [75, 90],           # 5-hour window
+    "alert_levels_week": [50, 75, 90],  # weekly limits
+    "alert_step": 0,                    # also alert every N% (0 = off, e.g. 25 -> 25, 50, 75, 100)
+    "alert_forecast": True,             # "at this pace you'll hit the limit at ..."
+    "quiet_enabled": False,
+    "quiet_from": "22:00",
+    "quiet_to": "08:00",
+    "snooze_until": 0.0,
+    "alert_sound": False,
+    "mascot": "subtle",                 # off | subtle | full
+    "mascot_animate": True,
     "desktop_notify": True,
     "notify_reset": True,
     "welcomed": False,          # first-run welcome window has been shown
@@ -169,6 +179,24 @@ def load_config(reset=False):
         cfg["limit_value"] = 0.0
     if not isinstance(cfg["alerted"], dict):
         cfg["alerted"] = {}
+    try:
+        cfg["alert_levels_week"] = sorted({min(100, max(1, int(x))) for x in cfg["alert_levels_week"]})
+    except (TypeError, ValueError):
+        cfg["alert_levels_week"] = [50, 75, 90]
+    try:
+        step = int(cfg["alert_step"])
+    except (TypeError, ValueError):
+        step = 0
+    cfg["alert_step"] = 0 if step < 5 else min(50, step)
+    for k, dflt in (("quiet_from", "22:00"), ("quiet_to", "08:00")):
+        if not (isinstance(cfg[k], str) and re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", cfg[k].strip())):
+            cfg[k] = dflt
+    if cfg["mascot"] not in ("off", "subtle", "full"):
+        cfg["mascot"] = "subtle"
+    try:
+        cfg["snooze_until"] = float(cfg["snooze_until"] or 0)
+    except (TypeError, ValueError):
+        cfg["snooze_until"] = 0.0
     return cfg
 
 
@@ -1060,6 +1088,88 @@ class DemoLive:
 
 
 # =============================================================================
+# Alert rules (pure functions, no UI)
+# =============================================================================
+def alert_levels_for(cfg, scope):
+    base = cfg.get("alert_levels") if scope == "session" else cfg.get("alert_levels_week")
+    levels = set()
+    for x in base or []:
+        if isinstance(x, int) and not isinstance(x, bool) and 0 < x <= 100:
+            levels.add(x)
+    step = cfg.get("alert_step") or 0
+    if isinstance(step, int) and step >= 5:
+        levels.update(range(step, 101, step))
+    return sorted(levels)
+
+
+def _hhmm(text):
+    h, m = str(text).strip().split(":")
+    return int(h) * 60 + int(m)
+
+
+def alerts_quiet(cfg, now):
+    """True while alerts should stay silent (snoozed, or inside quiet hours). The banner still shows."""
+    if float(cfg.get("snooze_until") or 0) > now:
+        return True
+    if not cfg.get("quiet_enabled"):
+        return False
+    try:
+        a, b = _hhmm(cfg.get("quiet_from", "22:00")), _hhmm(cfg.get("quiet_to", "08:00"))
+    except ValueError:
+        return False
+    lt = time.localtime(now)
+    cur = lt.tm_hour * 60 + lt.tm_min
+    if a == b:
+        return False
+    return a <= cur < b if a < b else (cur >= a or cur < b)
+
+
+def plan_alerts(cfg, s, alerted, now):
+    """-> list of new alert events; marks them in `alerted` so each fires once per window/period."""
+    events = []
+    if not cfg.get("alerts") or not s:
+        return events
+    w, g = s["window"], s["gauge"]
+    pace_only = cfg.get("alerts_pace_only")
+    checks = []   # (key, scope, pct, label, reset, elapsed)
+    if w and g["pct"] is not None:
+        checks.append(("w%d" % int(w["end"]), "session", g["pct"], "Your 5-hour window", w["end"], w["elapsed"]))
+    if s["live"].get("status") in ("ok", "stale"):
+        for it in s["live"].get("items") or []:
+            if it["key"] == "five_hour":
+                continue
+            rs = it["resets"]
+            el = min(1.0, max(0.0, 1 - ((rs or now) - now) / (7 * 86400.0)))
+            checks.append(("%s:%d" % (it["key"], int(rs or 0)), "week", it["pct"], it["label"], rs, el))
+    for key, scope, pct, label, reset, elapsed in checks:
+        levels = alert_levels_for(cfg, scope)
+        if not levels or (pace_only and not pct / 100.0 > elapsed):
+            continue
+        done = set(alerted.get(key, []))
+        hit = [lv for lv in levels if pct >= lv and lv not in done]
+        if hit:
+            alerted[key] = sorted(done | set(hit))
+            tail = f" · resets {fmt_when(reset, now)}" if reset else ""
+            events.append({"kind": "threshold", "scope": scope, "level": max(hit), "pct": pct, "label": label,
+                           "text": f"{label} is at {pct:.0f}%{tail}", "title": f"Limitline · {max(hit)}%"})
+    # forecast: you will run out before the window resets, and you've really started using it
+    eta = g.get("eta")
+    if cfg.get("alert_forecast") and w and eta and g["pct"] is not None and 20 <= g["pct"] < 100 \
+            and w.get("rate", 0) > 0 and eta < w["end"]:
+        fkey = "f:w%d" % int(w["end"])
+        if not alerted.get(fkey):
+            alerted[fkey] = [1]
+            events.append({"kind": "forecast", "scope": "session", "level": 85, "pct": g["pct"],
+                           "label": "5-hour window",
+                           "text": f"At this pace you'll hit your limit around {fmt_clock(eta)}, "
+                                   f"{fmt_dur(max(0, w['end'] - eta))} before it resets.",
+                           "title": "Limitline · pace warning"})
+    while len(alerted) > 60:
+        alerted.pop(next(iter(alerted)))
+    return events
+
+
+# =============================================================================
 # Aggregation
 # =============================================================================
 def new_agg():
@@ -1633,6 +1743,247 @@ def render_gfx(w, h, bg, shapes):
 
 
 # =============================================================================
+# Mascot "Tick": an original little gauge character that reacts to alerts
+# =============================================================================
+MASCOT_N = 12
+
+
+def mascot_mood(ev):
+    if ev["kind"] == "reset":
+        return "joy"
+    if ev["kind"] == "forecast":
+        return "worried"
+    p = ev["pct"]
+    return "happy" if p < 50 else "calm" if p < 75 else "worried" if p < 90 else "alarmed" if p < 100 else "out"
+
+
+def mascot_caption(ev):
+    m = mascot_mood(ev)
+    if ev["kind"] == "forecast":
+        return ev["text"]
+    return {"happy": "Nice and easy. %d%% used." % ev["pct"], "calm": "Halfway there. %d%% used." % ev["pct"],
+            "worried": "Heads up: %d%% used." % ev["pct"], "alarmed": "Almost out! %d%% used." % ev["pct"],
+            "out": "Limit reached.", "joy": "Fresh start! Window reset."}[m]
+
+
+def mascot_shapes(i, mood, body, ink, size):
+    """Shapes for frame i of MASCOT_N, on a 100x100 design grid scaled to `size`."""
+    k = size / 100.0
+    ph = 2 * math.pi * i / MASCOT_N
+    bob = math.sin(ph) * 2.5 if mood not in ("out",) else 0
+    if mood == "alarmed":
+        bob = math.sin(ph * 2) * 2.0
+    tilt = {"happy": -0.5, "calm": -0.1, "worried": 0.35, "alarmed": 0.7, "out": 1.0, "joy": -0.7}[mood]
+    top = 30 + bob
+    sh = []
+    sh.append(g_rrect(24, top, 76, top + 50, 16, body))
+    sh.append(g_rrect(30, top + 6, 70, top + 30, 10, "#ffffff"))
+    ax, ay = 50, top
+    tipx, tipy = ax + math.sin(tilt + math.sin(ph) * 0.12) * 20, ay - math.cos(tilt) * 20
+    sh.append(g_line([(ax, ay), (tipx, tipy)], 1.6, ink))
+    sh.append(g_disc(tipx, tipy, 3.6, body if mood != "out" else "#d03b3b"))
+    blink = i in (5, 6) and mood in ("happy", "calm", "worried")
+    ey = top + 17
+    if mood == "joy":
+        for ex in (41, 59):
+            sh.append(g_line([(ex - 4, ey + 2), (ex, ey - 3), (ex + 4, ey + 2)], 1.6, ink))
+    elif mood == "out":
+        for ex in (41, 59):
+            sh.append(g_line([(ex - 3.5, ey - 3.5), (ex + 3.5, ey + 3.5)], 1.5, ink))
+            sh.append(g_line([(ex - 3.5, ey + 3.5), (ex + 3.5, ey - 3.5)], 1.5, ink))
+    elif blink:
+        for ex in (41, 59):
+            sh.append(g_line([(ex - 3.5, ey), (ex + 3.5, ey)], 1.5, ink))
+    else:
+        r = 4.6 if mood == "alarmed" else 3.6
+        for ex in (41, 59):
+            sh.append(g_disc(ex, ey, r, ink))
+    my = top + 41
+    if mood in ("happy", "joy"):
+        sh.append(g_line([(41, my - 5), (50, my + 1), (59, my - 5)], 1.8, "#ffffff"))
+    elif mood == "calm":
+        sh.append(g_line([(43, my - 3), (57, my - 3)], 1.8, "#ffffff"))
+    elif mood == "worried":
+        sh.append(g_line([(42, my), (50, my - 3), (58, my)], 1.8, "#ffffff"))
+        d = (i % MASCOT_N) / MASCOT_N
+        sh.append(g_disc(70, top + 12 + d * 10, 3.2, "#7cc4f0"))
+    elif mood == "alarmed":
+        sh.append(g_ring(50, my - 1, 4.5, 1.4, "#ffffff"))
+        sh.append(g_disc(72, top + 8 + (i % 6) * 2.5, 3.2, "#7cc4f0"))
+    else:
+        sh.append(g_line([(42, my + 1), (47, my - 2), (53, my + 1), (58, my - 2)], 1.8, "#ffffff"))
+    if mood == "joy":
+        for n, (sx, sy) in enumerate(((18, 28), (84, 36), (80, 14))):
+            r = 2.2 + 1.8 * abs(math.sin(ph + n))
+            sh.append(g_line([(sx - r, sy), (sx + r, sy)], 1.0, body))
+            sh.append(g_line([(sx, sy - r), (sx, sy + r)], 1.0, body))
+    # feet
+    sh.append(g_disc(38, top + 53, 4.5, ink))
+    sh.append(g_disc(62, top + 53, 4.5, ink))
+    # arm wave for happy/joy
+    if mood in ("happy", "joy"):
+        wv = math.sin(ph * 2) * 6
+        sh.append(g_line([(76, top + 30), (86, top + 20 + wv)], 2.4, body))
+    sc = []
+    for bb, fn, col in sh:
+        x0, y0, x1, y1 = bb
+        sc.append(((x0 * k, y0 * k, x1 * k, y1 * k),
+                   (lambda x, y, fn=fn: fn(x / k, y / k)), col))
+    return sc
+
+
+class Mascot:
+    """Borderless card with an animated character; frames are rendered off the UI thread."""
+
+    def __init__(self, app):
+        self.app, self.win, self.job = app, None, None
+        self.frames, self.idx, self.token = [], 0, 0
+
+    def wanted(self, ev):
+        mode = self.app.cfg.get("mascot", "subtle")
+        if mode == "off":
+            return False
+        if mode == "full":
+            return True
+        return ev["kind"] != "threshold" or ev["level"] >= 75
+
+    def event(self, ev):
+        if not self.wanted(ev):
+            return
+        self.token += 1
+        tok, app = self.token, self.app
+        mood = mascot_mood(ev)
+        th = app.th
+        body = {"happy": th["accent"], "calm": th["accent"], "joy": STATUS["good"],
+                "worried": STATUS["warn"], "alarmed": STATUS["crit"], "out": STATUS["crit"]}[mood]
+        size = app.px(104)
+        animate = bool(app.cfg.get("mascot_animate", True)) and not reduced_motion()
+        card = th["surface"]
+        ink = "#1a1a1a"
+        frames_wanted = range(MASCOT_N) if animate else [3]
+
+        def work():
+            try:
+                data = [render_gfx(size, size, card, mascot_shapes(i, mood, body, ink, size)) for i in frames_wanted]
+                app.q.put(("mascot", tok, ev, data, size, animate))
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def show(self, tok, ev, data, size, animate):
+        if tok != self.token:
+            return
+        self.hide()
+        app, th = self.app, self.app.th
+        self.frames = []
+        for d in data:
+            im = tk.PhotoImage(master=app.root, width=size, height=size)
+            im.put(d)
+            self.frames.append(im)
+        w = self.win = tk.Toplevel(app.root)
+        w.withdraw()
+        w.overrideredirect(True)
+        try:
+            w.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        edge = tk.Frame(w, bg=th["accent"], padx=1, pady=1)
+        edge.pack()
+        card = tk.Frame(edge, bg=th["surface"], padx=app.px(10), pady=app.px(8))
+        card.pack()
+        self.lab = tk.Label(card, image=self.frames[0], bg=th["surface"], bd=0)
+        self.lab.pack(side="left")
+        tk.Label(card, text=mascot_caption(ev), bg=th["surface"], fg=th["ink"], font=app.f["body"],
+                 wraplength=app.px(190), justify="left").pack(side="left", padx=(app.px(10), app.px(4)))
+        for wd in (w, edge, card, self.lab) + tuple(card.winfo_children()):
+            wd.bind("<Button-1>", lambda e: self.hide())
+        w.update_idletasks()
+        self.place(w)
+        try:
+            w.attributes("-alpha", 0.0)
+        except tk.TclError:
+            pass
+        w.deiconify()
+        w.lift()
+        self.idx = 0
+        self.t0 = time.time()
+        self.life = 9.0 if self.app.cfg.get("mascot") == "full" else 6.5
+        self.tick(animate)
+
+    def place(self, w):
+        r = self.app.root
+        ww, wh = w.winfo_reqwidth(), w.winfo_reqheight()
+        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
+        x = r.winfo_rootx() - ww - self.app.px(10)
+        if x < 8:
+            x = r.winfo_rootx() + r.winfo_width() + self.app.px(10)
+        x = max(8, min(x, sw - ww - 8))
+        y = max(8, min(r.winfo_rooty(), sh - wh - 48))
+        w.geometry(f"+{x}+{y}")
+
+    def tick(self, animate):
+        w = self.win
+        if w is None or not w.winfo_exists():
+            return
+        age = time.time() - self.t0
+        if age >= self.life:
+            return self.hide()
+        a = min(1.0, age / 0.25, (self.life - age) / 0.4)
+        try:
+            w.attributes("-alpha", max(0.0, a))
+        except tk.TclError:
+            pass
+        if animate and len(self.frames) > 1:
+            self.idx = (self.idx + 1) % len(self.frames)
+            self.lab.configure(image=self.frames[self.idx])
+        self.job = self.app.root.after(85, lambda: self.tick(animate))
+
+    def hide(self):
+        if self.job:
+            try:
+                self.app.root.after_cancel(self.job)
+            except Exception:
+                pass
+            self.job = None
+        if self.win is not None:
+            try:
+                self.win.destroy()
+            except Exception:
+                pass
+            self.win = None
+
+
+def reduced_motion():
+    """Best effort: honour the OS 'reduce animations' setting."""
+    try:
+        if IS_WIN:
+            import ctypes
+            on = ctypes.c_int(1)
+            ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(on), 0)   # SPI_GETCLIENTAREAANIMATION
+            return not on.value
+        if IS_MAC:
+            r = subprocess.run(["defaults", "read", "com.apple.universalaccess", "reduceMotion"],
+                               capture_output=True, text=True, timeout=2)
+            return r.stdout.strip() == "1"
+        r = subprocess.run(["gsettings", "get", "org.gnome.desktop.interface", "enable-animations"],
+                           capture_output=True, text=True, timeout=2)
+        return r.stdout.strip() == "false"
+    except Exception:
+        return False
+
+
+def beep(root):
+    try:
+        if IS_WIN:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        else:
+            root.bell()
+    except Exception:
+        pass
+
+
+# =============================================================================
 # UI - widgets
 # =============================================================================
 class FloatTip:
@@ -1856,6 +2207,7 @@ class App:
         self.store = self.make_store()
         self.live = DemoLive(args.demo) if args.demo else LiveLimits(self)
         self.tip = FloatTip(self)
+        self.mascot = Mascot(self)
         self.topmost_var = tk.BooleanVar(value=bool(cfg["topmost"]))
         root.title(APP_NAME)
         root.resizable(False, False)
@@ -2254,6 +2606,14 @@ class App:
         for i, (key, label) in enumerate(self.TABS, 1):
             m.add_command(label=label, accelerator=str(i), command=lambda k=key: self.set_tab(k))
         m.add_separator()
+        if float(self.cfg.get("snooze_until") or 0) > time.time():
+            m.add_command(label="Resume alerts", command=lambda: self.snooze(0))
+        else:
+            sn = tk.Menu(m, tearoff=0, bg=self.th["surface"], fg=self.th["ink"], bd=0, relief="flat",
+                         activebackground=self.th["accent_soft"], activeforeground=self.th["ink"], font=self.f["body"])
+            for label, mins in (("30 minutes", 30), ("1 hour", 60), ("2 hours", 120), ("4 hours", 240)):
+                sn.add_command(label=label, command=lambda mm=mins: self.snooze(mm))
+            m.add_cascade(label="Snooze alerts", menu=sn)
         m.add_command(label="Export CSV…", command=self.export_csv)
         m.add_command(label="Open logs folder", command=self.open_logs)
         m.add_command(label="Settings…", accelerator="S", command=self.open_settings)
@@ -2275,6 +2635,8 @@ class App:
                 elif item[0] == "progress":
                     self.progress = (item[1], item[2])
                     self.update_footer()
+                elif item[0] == "mascot":
+                    self.mascot.show(*item[1:])
                 elif item[0] == "error":
                     self.error, self.progress = item[1], None
                     self.update_footer()
@@ -3002,43 +3364,34 @@ class App:
     def check_alerts(self, s):
         if not s:
             return
-        cfg = self.cfg
-        levels = sorted({x for x in cfg.get("alert_levels") or [] if isinstance(x, int) and 0 < x <= 100})
-        w, g, now = s["window"], s["gauge"], s["now"]
-        checks = []
-        pace_only = cfg.get("alerts_pace_only")
-        if w and g["pct"] is not None and (not pace_only or g["pct"] / 100.0 > w["elapsed"]):
-            checks.append(("w%d" % int(w["end"]), g["pct"], "Your 5-hour window", w["end"]))
-        if s["live"].get("status") == "ok":
-            for it in s["live"].get("items") or []:
-                el = 1 - ((it["resets"] or now) - now) / (7 * 86400.0)
-                if it["key"] != "five_hour" and (not pace_only or it["pct"] / 100.0 > el):
-                    checks.append(("%s:%d" % (it["key"], int(it["resets"] or 0)), it["pct"], it["label"], it["resets"]))
-        if cfg.get("alerts") and levels:
-            alerted = cfg.setdefault("alerted", {})
-            changed = False
-            for key, pct, label, reset in checks:
-                done = set(alerted.get(key, []))
-                hit = [lv for lv in levels if pct >= lv and lv not in done]
-                if hit:
-                    done.update(hit)
-                    alerted[key] = sorted(done)
-                    changed = True
-                    tail = f" · resets {fmt_when(reset, now)}" if reset else ""
-                    self.raise_alert(max(hit), f"{label} is at {pct:.0f}%{tail}")
-                    self.run_hook("on_alert_command", "threshold", label, pct)
-            if changed:
-                while len(alerted) > 40:
-                    alerted.pop(next(iter(alerted)))
-                self.save_soon()
+        cfg, now = self.cfg, s["now"]
+        quiet = alerts_quiet(cfg, now)
+        events = plan_alerts(cfg, s, cfg.setdefault("alerted", {}), now)
+        for ev in events:
+            self.raise_alert(ev, quiet)
+            self.run_hook("on_alert_command", ev["kind"], ev["label"], ev["pct"])
+        if events:
+            self.save_soon()
+        w, g = s["window"], s["gauge"]
         key = "w%d" % int(w["end"]) if w else None
         pct = (g["pct"] or 0) if w else 0
         pw = self.prev_win
-        if (pw and pw["key"] and pw["key"] != key and cfg.get("notify_reset") and levels
+        levels = alert_levels_for(cfg, "session")
+        if (cfg.get("alerts") and pw and pw["key"] and pw["key"] != key and cfg.get("notify_reset") and levels
                 and pw["max"] >= levels[0]):
-            self.raise_alert(0, "Your 5-hour window has reset. Full capacity is back.", title="Window reset")
+            ev = {"kind": "reset", "scope": "session", "level": 0, "pct": 0, "label": "5-hour window",
+                  "text": "Your 5-hour window has reset. Full capacity is back.", "title": "Window reset"}
+            self.raise_alert(ev, quiet)
             self.run_hook("on_reset_command", "reset", "5-hour window", 0)
         self.prev_win = {"key": key, "max": max(pct, pw["max"] if pw and pw["key"] == key else 0)}
+
+    def snooze(self, minutes):
+        self.cfg["snooze_until"] = time.time() + minutes * 60 if minutes else 0.0
+        self.save_soon()
+        self.toast = (f"Alerts snoozed for {minutes // 60 if minutes % 60 == 0 else minutes} "
+                      f"{'hour' if minutes == 60 else 'hours' if minutes % 60 == 0 else 'min'}" if minutes
+                      else "Alerts resumed", time.time() + 5)
+        self.update_footer()
 
     def run_hook(self, key, event, label, pct):
         cmd = str(self.cfg.get(key) or "").strip()
@@ -3050,14 +3403,20 @@ class App:
         except OSError:
             pass
 
-    def raise_alert(self, level, text, title=None):
-        self.banner = (level, text, time.time())
+    def raise_alert(self, ev, quiet=False):
+        level = ev["level"]
+        self.banner = (level, ev["text"], time.time())
         col = STATUS["crit"] if level >= 90 else (STATUS["warn"] if level else self.th["accent"])
         if not self.cfg["mini"]:
             self.render_banner()
+        if quiet:
+            return      # snoozed or quiet hours: the banner is the only trace
         self.flash(col, 8)
         if self.cfg.get("desktop_notify"):
-            notify_desktop(title or f"Limitline · {level}%", text)
+            notify_desktop(ev["title"], ev["text"])
+        if self.cfg.get("alert_sound"):
+            beep(self.root)
+        self.mascot.event(ev)
 
     def flash(self, color, n):
         if n <= 0 or not self.root.winfo_exists():
@@ -3345,6 +3704,10 @@ class SettingsDialog:
             "limit": tk.StringVar(value=self._limit_text(cfg["limit_value"], cfg["metric"])),
             "refresh": tk.StringVar(value=str(cfg["refresh_sec"])),
             "levels": tk.StringVar(value=", ".join(str(x) for x in cfg["alert_levels"])),
+            "levels_week": tk.StringVar(value=", ".join(str(x) for x in cfg["alert_levels_week"])),
+            "step": tk.StringVar(value=str(cfg["alert_step"] or "")),
+            "qfrom": tk.StringVar(value=cfg["quiet_from"]),
+            "qto": tk.StringVar(value=cfg["quiet_to"]),
             "extra": tk.StringVar(value=(cfg["extra_paths"] or [""])[0]),
             "hook": tk.StringVar(value=cfg.get("on_alert_command") or ""),
             "opacity": tk.IntVar(value=int(round(cfg["opacity"] * 100))),
@@ -3536,10 +3899,34 @@ class SettingsDialog:
             self.entry("levels", 9)(fr).pack(side="left", ipady=px(2))
             tk.Label(fr, text="%", font=f["small"], fg=th["muted"], bg=th["surface"]).pack(side="left", padx=(px(4), 0))
             return fr
-        self.row(box, "Alert at", levels, "Comma-separated, e.g. 75, 90")
+        self.row(box, "5-hour alerts at", levels, "Comma-separated, e.g. 75, 90")
+
+        def pct_entry(var, hint):
+            def make(parent):
+                fr = tk.Frame(parent, bg=th["surface"])
+                self.entry(var, 9)(fr).pack(side="left", ipady=px(2))
+                tk.Label(fr, text=hint, font=f["small"], fg=th["muted"], bg=th["surface"]).pack(side="left", padx=(px(4), 0))
+                return fr
+            return make
+        self.row(box, "Weekly alerts at", pct_entry("levels_week", "%"), "Applies to the weekly limits")
+        self.row(box, "Also every", pct_entry("step", "%"), "e.g. 25 gives 25, 50, 75, 100. Empty = off")
+        self.row(box, "Pace warning", self.switch("alert_forecast"), "Warn when you're on course to run out early")
         self.row(box, "Only when ahead of pace", self.switch("alerts_pace_only"),
                  "Skip alerts while usage is behind the clock")
+        self.row(box, "Mascot", self.seg("mascot", [("off", "Off"), ("subtle", "Subtle"), ("full", "Every alert")]),
+                 "Subtle: only at 75%+, pace warnings and resets")
+        self.row(box, "Animate mascot", self.switch("mascot_animate"), "Turns itself off if your OS reduces motion")
         self.row(box, "Desktop notifications", self.switch("desktop_notify"))
+        self.row(box, "Alert sound", self.switch("alert_sound"))
+        self.row(box, "Quiet hours", self.switch("quiet_enabled"), "Banner only, no flash, sound, notification or mascot")
+
+        def quiet(parent):
+            fr = tk.Frame(parent, bg=th["surface"])
+            self.entry("qfrom", 6)(fr).pack(side="left", ipady=px(2))
+            tk.Label(fr, text="to", font=f["small"], fg=th["muted"], bg=th["surface"]).pack(side="left", padx=px(6))
+            self.entry("qto", 6)(fr).pack(side="left", ipady=px(2))
+            return fr
+        self.row(box, "Quiet from", quiet, "24-hour times, e.g. 22:00 to 08:00")
         self.row(box, "Tell me when a window resets", self.switch("notify_reset"))
         self.row(box, "Run on alert", self.entry("hook", 18),
                  "Optional shell command (gets LIMITLINE_PCT / _LABEL / _EVENT)")
@@ -3598,6 +3985,10 @@ class SettingsDialog:
         self.vars["limit"].set("")
         self.vars["refresh"].set(str(DEFAULTS["refresh_sec"]))
         self.vars["levels"].set(", ".join(str(x) for x in DEFAULTS["alert_levels"]))
+        self.vars["levels_week"].set(", ".join(str(x) for x in DEFAULTS["alert_levels_week"]))
+        self.vars["step"].set("")
+        self.vars["qfrom"].set(DEFAULTS["quiet_from"])
+        self.vars["qto"].set(DEFAULTS["quiet_to"])
         self.vars["extra"].set("")
         self.vars["opacity"].set(int(DEFAULTS["opacity"] * 100))
         self.build()
@@ -3611,6 +4002,12 @@ class SettingsDialog:
         except ValueError:
             pass
         v["alert_levels"] = sorted({min(100, max(1, int(x))) for x in re.findall(r"\d+", self.vars["levels"].get())})
+        v["alert_levels_week"] = sorted({min(100, max(1, int(x))) for x in re.findall(r"\d+", self.vars["levels_week"].get())})
+        st = re.findall(r"\d+", self.vars["step"].get())
+        v["alert_step"] = int(st[0]) if st and int(st[0]) >= 5 else 0
+        for key, var, dflt in (("quiet_from", "qfrom", "22:00"), ("quiet_to", "qto", "08:00")):
+            t = self.vars[var].get().strip()
+            v[key] = t if re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", t) else dflt
         v["limit_value"] = parse_amount(self.vars["limit"].get())
         if v["limit_mode"] == "custom" and v["limit_value"] <= 0:
             v["limit_mode"] = "auto"
@@ -3899,6 +4296,24 @@ def run_selftest(args):
                         app.screen_bounds = real
                     return h <= 728, f"settings is {h}px tall on a 728px screen" + (" (scrolls)" if scrolls else "")
                 check("settings fits a 1366x768 laptop", small_screen)
+
+                def mascot_check():
+                    ev = {"kind": "threshold", "scope": "session", "level": 90, "pct": 92, "label": "x",
+                          "text": "x", "title": "x"}
+                    saved = app.cfg.get("mascot")
+                    app.cfg["mascot"] = "full"
+                    try:
+                        app.mascot.event(ev)
+                        end = time.time() + 15
+                        while time.time() < end and app.mascot.win is None:
+                            root.update()
+                            time.sleep(0.05)
+                        ok = app.mascot.win is not None and len(app.mascot.frames) >= 1
+                        app.mascot.hide()
+                    finally:
+                        app.cfg["mascot"] = saved
+                    return ok, "mascot card appeared" if ok else "mascot card did not appear"
+                check("alert mascot shows", mascot_check)
 
                 def welcome():
                     app.open_welcome()

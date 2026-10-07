@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.3
+- **Alerts upgraded:** separate levels for the 5-hour window and weekly limits, optional "every N%" steps (25 → 50 → 75 → 100), a pace warning ("at this pace you'll run out at 15:40"), quiet hours, snooze from the right-click menu, optional sound. During quiet hours or a snooze the banner still shows; flash, sound, notification and mascot stay silent.
+- **Mascot "Tick":** an original animated gauge character appears beside the widget when an alert fires, with a mood for each level (calm → worried → alarmed → out, joyful on reset). Off / Subtle / Every alert; stops animating when the OS asks to reduce motion; click to dismiss.
+- Alert rules are now a tested pure function; selftest checks the mascot.
+
 ## 2.2
 - **Easier setup:** first-run welcome window (history found, one-click Connect, start with computer); a Connect button right on the limits card; `install.bat` / `install.sh` that install Python if needed, add a launcher, connect, autostart and launch, with clean `--uninstall`; `pip` / `pipx` install (`limitline`, `limitline-gui`); `--setup`, `--autostart on|off`.
 - **Renamed to Limitline** (neutral name, "unofficial" notice) to follow Anthropic's trademark rules. Settings migrate from `~/.claude-usage-popup.json`; hook variables are now `LIMITLINE_EVENT/LABEL/PCT`; if you connected the old build's status line, run `--install-statusline` again.

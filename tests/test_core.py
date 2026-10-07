@@ -197,6 +197,35 @@ with open(os.path.join(pj, "s.jsonl"), "w") as fh:
 st2 = c.LogStore(); st2.scan([os.path.join(tmp2, "projects")], 0)
 bill, logged_then = st2.cost_states["S9"]
 check(abs(logged_then - 0.02) < 1e-9 and bill == 0.0205, f"coverage snapshot compares like with like ({logged_then}, {bill})")
+
+# ---- alerts (v2.3)
+import time as _t
+cfg = dict(c.DEFAULTS)
+check(c.alert_levels_for(cfg, "session") == [75, 90] and c.alert_levels_for(cfg, "week") == [50, 75, 90], "default alert levels per scope")
+cfg2 = dict(cfg, alert_step=25)
+check(c.alert_levels_for(cfg2, "session") == [25, 50, 75, 90, 100], "step adds every-N% levels and keeps custom ones")
+tnow = 1_700_000_000.0
+def snap(pct, eta=None, rate=1.0, elapsed=0.5):
+    return {"tnow": tnow, "window": {"end": tnow + 9000, "elapsed": elapsed, "rate": rate},
+            "gauge": {"pct": pct, "eta": eta}, "live": {"status": "off", "items": []}}
+al = {}
+e1 = c.plan_alerts(cfg, snap(80), al, tnow)
+check(len(e1) == 1 and e1[0]["level"] == 75 and e1[0]["kind"] == "threshold", "crossing 75% fires once")
+check(c.plan_alerts(cfg, snap(82), al, tnow) == [], "no repeat inside the same window")
+e2 = c.plan_alerts(cfg, snap(93), al, tnow)
+check(len(e2) == 1 and e2[0]["level"] == 90, "next level fires later")
+al = {}
+e3 = c.plan_alerts(dict(cfg, alert_forecast=True), snap(40, eta=tnow + 3000), al, tnow)
+check(len(e3) == 1 and e3[0]["kind"] == "forecast", "forecast fires when the limit would arrive before reset")
+check(c.plan_alerts(cfg, snap(40, eta=tnow + 3000), al, tnow) == [], "forecast fires once per window")
+check(c.plan_alerts(dict(cfg, alert_forecast=False), snap(40, eta=tnow + 3000), {}, tnow) == [], "forecast can be turned off")
+check(c.plan_alerts(dict(cfg, alerts=False), snap(95), {}, tnow) == [], "alerts off means silence")
+check(c.plan_alerts(dict(cfg, alerts_pace_only=True), snap(80, elapsed=0.95), {}, tnow) == [], "pace-only skips alerts while behind the clock")
+lt = _t.mktime((2026, 10, 8, 23, 30, 0, 0, 0, -1))
+check(c.alerts_quiet(dict(cfg, quiet_enabled=True), lt) and not c.alerts_quiet(dict(cfg, quiet_enabled=True), lt - 6 * 3600 - 3600 * 5), "quiet hours wrap past midnight")
+check(c.alerts_quiet(dict(cfg, snooze_until=lt + 60), lt) and not c.alerts_quiet(dict(cfg, snooze_until=lt - 1), lt), "snooze works and expires")
+check(c.mascot_mood({"kind": "threshold", "pct": 92}) == "alarmed" and c.mascot_mood({"kind": "reset", "pct": 0}) == "joy", "mascot mood follows the level")
+check(all(len(c.mascot_shapes(i, m, "#d4a24c", "#1a1a1a", 60)) > 8 for i in (0, 5) for m in ("happy", "calm", "worried", "alarmed", "out", "joy")), "mascot frames build for every mood")
 check(__import__("re").search(r'version = "(\d+\.\d+)', open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pyproject.toml")).read()).group(1) == c.VERSION, "pyproject version matches the app version")
 print("\nFAILURES:", fails if fails else "none")
 

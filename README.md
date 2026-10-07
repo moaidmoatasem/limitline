@@ -35,6 +35,9 @@ First launch shows a three-step welcome window (history found, **Connect** live 
 
 Details: [docs/INSTALL.md](docs/INSTALL.md).
 
+## Alerts and the mascot
+Alerts can fire at your own levels for the 5-hour and weekly limits, at every N% (say 25 → 50 → 75 → 100), or as a pace warning when you're on course to run out early. Quiet hours and a right-click **Snooze** keep them silent (the banner still shows). A small original character, Tick, pops up beside the widget and changes mood as usage climbs; choose Off, Subtle or Every alert in Settings.
+
 ## Controls
 
 | Key / action | What it does |
