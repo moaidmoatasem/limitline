@@ -90,6 +90,7 @@ CONFIG_PATH = os.path.join(HOME, ".limitline.json")
 WINDOW_SEC = 5 * 3600
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 INSTANCE_PORT = 47613
+_LOCK = None
 
 # =============================================================================
 # Settings
@@ -1127,6 +1128,12 @@ class LiveLimits:
         b = read_bridge()
         if self.app.cfg.get("live_oauth") and not (b and b[0] and time.time() - b[1] <= 900):
             st = self.fetch_oauth()
+            try:
+                _write_json_atomic(os.path.join(os.path.dirname(CONFIG_PATH), ".limitline-login-check.json"),
+                                   {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "status": st.get("status"),
+                                    "msg": st.get("msg"), "items": len(st.get("items") or [])})
+            except OSError:
+                pass
             if st["status"] == "ok" or not (b and b[0]):
                 st.setdefault("source", "oauth")
                 return st
@@ -2371,6 +2378,10 @@ class App:
             pass
         if not args.demo:
             root.after(5000, self.watch_config)
+            try:
+                self._script_mtime = os.path.getmtime(os.path.abspath(__file__))
+            except OSError:
+                self._script_mtime = None
             threading.Thread(target=write_logcheck, daemon=True).start()
         if getattr(args, "open_settings", False):
             root.after(600, self.open_settings)
@@ -3669,7 +3680,31 @@ class App:
                 self.worker.wake.set()
         except Exception:  # noqa: BLE001
             pass
+        try:
+            m = os.path.getmtime(os.path.abspath(__file__))
+            if self._script_mtime and m != self._script_mtime and time.time() - m > 3:
+                with open(os.path.abspath(__file__), encoding="utf-8") as fh:
+                    compile(fh.read(), __file__, "exec")       # never restart into a broken file
+                self.restart()
+                return
+        except (OSError, SyntaxError, ValueError):
+            pass
         self.root.after(5000, self.watch_config)
+
+    def restart(self):
+        """Relaunch this same app on the updated file (an update was installed)."""
+        global _LOCK
+        try:
+            self.cfg["x"], self.cfg["y"] = self.root.winfo_x(), self.root.winfo_y()
+            save_config(self.cfg)
+            if _LOCK is not None:
+                _LOCK.close()
+                _LOCK = None
+            subprocess.Popen([sys.executable, os.path.abspath(__file__)] + sys.argv[1:],
+                             env=dict(os.environ, LIMITLINE_RESTART="1"), close_fds=True,
+                             creationflags=0x00000008 if IS_WIN else 0)
+        finally:
+            self.root.destroy()
 
     def quit(self):
         try:
@@ -4578,14 +4613,21 @@ def main():
               "python.org installer.", file=sys.stderr)
         sys.exit(1)
 
+    global _LOCK
     lock = None
     if not (args.multi or args.demo):
         lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            lock.bind(("127.0.0.1", INSTANCE_PORT))
-        except OSError:
-            print(f"{APP_NAME} is already running (use --multi to start another).", file=sys.stderr)
-            sys.exit(0)
+        tries = 40 if os.environ.pop("LIMITLINE_RESTART", None) else 1
+        for i in range(tries):
+            try:
+                lock.bind(("127.0.0.1", INSTANCE_PORT))
+                break
+            except OSError:
+                if i == tries - 1:
+                    print(f"{APP_NAME} is already running (use --multi to start another).", file=sys.stderr)
+                    sys.exit(0)
+                time.sleep(0.25)
+        _LOCK = lock
 
     if IS_WIN:
         try:
