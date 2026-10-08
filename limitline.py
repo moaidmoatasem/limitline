@@ -579,7 +579,23 @@ def write_logcheck(max_files=8):
                         out["ts_samples"].append(type(tsv).__name__ + ":" + str(tsv)[:32])
                     before = len(probe.by_key)
                     probe._parse(raw, f)
-                    out["parsed_ok"] += len(probe.by_key) > before
+                    added = len(probe.by_key) > before
+                    out["parsed_ok"] += added
+                    pf = out.setdefault("per_file", {}).setdefault(str(len(out["newest"])), {"usage": 0, "new": 0, "models": {}, "ts": [], "why": {}})
+                    pf["usage"] += 1
+                    pf["new"] += added
+                    m2 = d.get("message") if isinstance(d.get("message"), dict) else {}
+                    mod = str(m2.get("model"))[:40]
+                    pf["models"][mod] = pf["models"].get(mod, 0) + 1
+                    tsx = parse_ts(d.get("timestamp"))
+                    if tsx:
+                        pf["ts"] = [min(pf["ts"][0], tsx) if pf["ts"] else tsx, max(pf["ts"][1], tsx) if pf["ts"] else tsx]
+                    if not added:
+                        u2 = m2.get("usage") or {}
+                        r = ("synthetic" if mod.startswith("<") else "zero" if not any(_int(u2.get(x)) for x in (
+                            "input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+                            else "dup" if (m2.get("id") or d.get("requestId")) else "other")
+                        pf["why"][r] = pf["why"].get(r, 0) + 1
         except OSError as ex:
             out["newest"].append(["error", str(ex)[:120]])
     for k in ("types", "top_keys", "msg_keys", "usage_keys"):
@@ -3108,7 +3124,11 @@ class App:
                 self.lbl(vf, v, "small").pack(side="left")
         else:
             self.lbl(st, "Idle", "h1").pack(anchor="w")
-            self.lbl(st, "Your next message starts a fresh 5-hour window.", "small", "ink2", justify="left",
+            live_items = [it for it in (s["live"].get("items") or []) if s["live"].get("status") in ("ok", "stale")]
+            idle_msg = ("No Claude Code use on this PC in the last 5 hours. Use on claude.ai, the desktop app or "
+                        "other computers only shows in the live limits below." if live_items
+                        else "Your next message starts a fresh 5-hour window.")
+            self.lbl(st, idle_msg, "small", "ink2", justify="left",
                      wraplength=self.CW - size - px(16)).pack(anchor="w", pady=(0, px(8)))
             grid = tk.Frame(st, bg=th["surface"])
             grid.pack(anchor="w")
@@ -3192,7 +3212,8 @@ class App:
         rows = [it for it in items if not (ring_live and it["key"] == "five_hour")]
         if st in ("ok", "stale") and rows:
             when = fmt_ago(s["now"] - live.get("fetched", s["now"]))
-            right = ("live · " if st == "ok" else "stale · ") + when
+            age = s["now"] - live.get("fetched", s["now"])
+            right = ("live · " if st == "ok" and age < 1800 else "updated ") + when
             title = "Weekly limits" if all(it["key"].startswith("seven_day") for it in rows) else "Plan limits"
             body, _ = self.card(self.content, title, right)
             for i, it in enumerate(rows):
@@ -3225,6 +3246,10 @@ class App:
                     for w in (r, top, bot) + tuple(top.winfo_children()) + tuple(bot.winfo_children()):
                         w.bind("<Enter>", lambda e, t=tip: self.tip.show(t, e.x_root, e.y_root))
                         w.bind("<Leave>", lambda e: self.tip.hide())
+            if s["now"] - live.get("fetched", s["now"]) > 1800 and live.get("source") != "oauth":
+                self.lbl(body, "Refreshes whenever you use Claude Code in a terminal. Covers all your Claude use "
+                               "(web, desktop, other PCs).", "tiny", "muted", justify="left",
+                         wraplength=self.CW).pack(anchor="w", pady=(px(8), 0))
             ex = live.get("extra")
             if ex:
                 r = tk.Frame(body, bg=th["surface"])
