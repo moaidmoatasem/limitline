@@ -15,12 +15,19 @@ for a in "$@"; do case "$a" in
 
 py="$(command -v python3 || true)"
 if [ "$uninstall" = 1 ]; then
+  hook=1
   if [ -n "$py" ] && [ -f "$dest/limitline.py" ]; then
-    "$py" "$dest/limitline.py" --uninstall-statusline || true
+    uout="$("$py" "$dest/limitline.py" --uninstall-statusline)" && hook=0
+    case "$uout" in *"Nothing to restore"*) hook=0;; esac   # never connected: nothing of ours can dangle
     "$py" "$dest/limitline.py" --autostart off || true
   fi
   rm -rf "$dest" "$bin/limitline" "$desktop"
-  echo "Removed Limitline, its launcher, startup entry and status-line hook. Settings (~/.limitline.json) were kept."
+  if [ "$hook" = 0 ]; then
+    echo "Removed Limitline, its launcher, startup entry and status-line hook. Settings (~/.limitline.json) were kept."
+  else
+    echo "Removed Limitline, its launcher and startup entry. Settings (~/.limitline.json) were kept."
+    echo "Warning: Claude Code's status-line hook may still point at the removed file. If Claude Code shows a status-line error, delete the statusLine entry from ~/.claude/settings.json."
+  fi
   exit 0
 fi
 
@@ -60,7 +67,9 @@ Categories=Utility;
 ENTRY
 fi
 
-"$py" "$dest/limitline.py" --install-statusline || true
+if ! "$py" "$dest/limitline.py" --install-statusline; then
+  echo "Note: live limits aren't connected yet - run 'limitline --install-statusline' later."
+fi
 [ "$autostart" = 1 ] && "$py" "$dest/limitline.py" --autostart on || true
 
 echo ""

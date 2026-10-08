@@ -4,7 +4,7 @@
 
 A small floating desktop window that keeps your **Claude Code** usage in view: how much of the current 5-hour window and the weekly limits you've used, when they reset, how fast you're burning, and where you'll land.
 
-One Python file. No dependencies beyond the standard library (tkinter). Windows, macOS and Linux.
+One Python file. No dependencies beyond the standard library (tkinter) - the optional system-tray icon adds `pip install "limitline[tray]"` (pystray + Pillow) and stays off without it. Windows, macOS and Linux.
 
 ![Overview](docs/img/overview.png)
 
@@ -12,9 +12,9 @@ One Python file. No dependencies beyond the standard library (tkinter). Windows,
 
 - **Live plan limits** from Claude Code's own documented status-line feature: your 5-hour and weekly percentages and reset times, with **no login or token access**. One-time connect: `python limitline.py --install-statusline` (or Settings > Connect). An opt-in advanced mode that uses the saved login is available but off by default, see [Terms and risk](#terms-and-risk).
 - **Pace awareness**: a white marker on each limit bar shows how much of the period has elapsed; the bar changes to "Ahead of pace" when you're using it faster than the clock. Burn rate ($/h, tokens/min), projection at reset, and an ETA to the limit.
-- **Four tabs**: Overview (ring gauge, today / 7d / 30d, last 24 hours by model), History (daily chart, weekday x hour heatmap, recent 5-hour windows), Projects, Sessions.
+- **Four tabs**: Overview (ring gauge, today / 7d / 30d, last 24 hours by model), History (daily chart - weekly bars at 90+ days - weekday x hour heatmap, recent 5-hour windows), Projects, Sessions.
 - **Alerts**: banner, border flash and desktop notification at thresholds you pick (default 75% and 90%), a heads-up when a full window resets, optional pace-only mode, and shell-command hooks.
-- **Mini pill** mode, dark and light themes, accents, opacity, always-on-top, launch at login.
+- **Mini pill** mode, dark and light themes, accents (the window/taskbar icon follows your accent; the Start-menu shortcut gets the same mark), opacity, always-on-top, launch at login.
 - **Multi-account**: run several copies with `--config-dir`.
 - **CSV export**, single-instance lock, `--demo` mode with sample data.
 
@@ -67,11 +67,11 @@ Alerts can fire at your own levels for the 5-hour and weekly limits, at every N%
 
 ## Important: what the numbers mean
 
-- **Percentages and reset times** are the ones Claude Code itself reports (status line), so they match what Claude Code shows. They update while Claude Code is open and are refreshed after your next message; the card shows how old they are. Per-model weekly limits (Sonnet / Opus) are not in that feed.
+- **Percentages and reset times** are the ones Claude Code itself reports (status line), so they match what Claude Code shows. They count your **whole account** - claude.ai, the desktop app, cloud sessions and other computers, not just this machine. They update while Claude Code is open and are refreshed after your next message; the card shows how old they are. The status-line feed normally carries only the 5-hour and weekly windows; the optional saved-login mode adds per-model weekly limits (Sonnet / Opus).
 - **Dollar figures and token totals** are *API-equivalent estimates* computed from Claude Code's local session logs, not a bill. On a subscription they show relative effort, not money.
-- **How close are they?** In the one real session we could check, the log-derived cost was within about 1% of Claude Code's own cost record at the moment it wrote it (Opus cost matched to the cent); the gap was small background calls. The app compares itself with that record and tells you when the match drops below 97%. Claude Code's record is a snapshot, so the check only compares like with like. This is one session, so treat it as encouraging, not proven.
+- **How close are they?** In the real sessions we could check, the log-derived cost matched Claude Code's own cost record to the cent. Whenever Claude Code's record is at least as fresh as the log, the footer alternates between the exact side-by-side comparison (`Claude Code $… · logs $… · …% match`) and the coverage percentage, and the session row shows the exact figures. Claude Code's record is a snapshot, so the check only compares like with like.
 - Models newer than the built-in price table are priced by assumption and flagged in the footer; set `price_overrides` to fix them.
-- Only **Claude Code on this computer** is visible. Claude.ai chat and other machines are not.
+- Only **Claude Code on this computer** is visible in the history, costs and projects - claude.ai chat and cloud runs write no local logs. The live percentages above are the exception: they are Anthropic's account-wide figures and cover everything on your plan.
 
 More in [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) and [docs/PRIVACY.md](docs/PRIVACY.md).
 
@@ -79,7 +79,7 @@ More in [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) and [docs/PRIVACY.md](docs/
 
 Anthropic's [legal page](https://code.claude.com/docs/en/legal-and-compliance) says Claude login (OAuth) tokens are for Claude Code and Anthropic's own apps, that third-party developers may not route requests through Free/Pro/Max credentials, and that developers may not "collect, store, or intermediate" those credentials. It also reserves the right to enforce without notice, and there are public reports of accounts affected after using subscription tokens in other tools.
 
-So this project's default path **never touches your login**: live limits come from the status-line data Claude Code hands to a command you configure, which is documented. The optional "Use saved login instead" mode (off by default) reads the token and calls an undocumented Anthropic endpoint; it exists for people who want per-model limits and accept that risk. We are not lawyers and this is not legal advice; if in doubt, leave it off.
+So this project's default path **never touches your login**: live limits come from the status-line data Claude Code hands to a command you configure, which is documented. The optional "Use saved login instead" mode (off by default) reads the token and calls undocumented Anthropic endpoints; it exists for people who want per-model limits, their account email and any prepaid balance (kept in memory only, never saved), and who accept that risk. A separate auto-refresh switch (also off by default) can run `claude update` once an hour when the login has expired - still only the native Claude CLI, no other host. We are not lawyers and this is not legal advice; if in doubt, leave it off.
 
 ## Configuration
 
@@ -108,7 +108,7 @@ python tests/test_core.py     # parsing, pricing, windows, aggregation (no displ
 python limitline.py --demo
 ```
 
-Contributions welcome. The app is deliberately a single stdlib-only file.
+Contributions welcome. The app is deliberately a single file whose core stays stdlib-only; optional extras (like the tray icon) must be opt-in, guarded and graceful when missing.
 
 ## License
 

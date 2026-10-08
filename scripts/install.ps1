@@ -21,15 +21,39 @@ function Find-Python {
   return $null
 }
 
+function Invoke-Exe {
+  # Runs a native command, silences its stderr, forwards its stdout, and returns only the exit
+  # code - without $ErrorActionPreference="Stop" turning PowerShell 5.1's redirected-stderr
+  # NativeCommandError into a script-killing error. Full stdout is left in $script:LastExeOut.
+  param([string]$Exe, [string[]]$Arguments)
+  $eap = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    $out = if ($Arguments) { & $Exe @Arguments 2>$null } else { & $Exe 2>$null }
+    $script:LastExeOut = if ($out) { ($out | Out-String).Trim() } else { "" }
+    if ($out) { foreach ($line in $out) { Write-Host $line } }
+    return $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $eap
+  }
+}
+
 if ($Uninstall) {
   $py = Find-Python
+  $hook = 1
   if ($py -and (Test-Path "$dest\limitline.py")) {
-    & (Join-Path $py "python.exe") "$dest\limitline.py" --uninstall-statusline 2>$null
-    & (Join-Path $py "python.exe") "$dest\limitline.py" --autostart off 2>$null
+    $hook = Invoke-Exe (Join-Path $py "python.exe") @("$dest\limitline.py", "--uninstall-statusline")
+    if ($script:LastExeOut -like "*Nothing to restore*") { $hook = 0 }   # never connected: nothing of ours can dangle
+    $null = Invoke-Exe (Join-Path $py "python.exe") @("$dest\limitline.py", "--autostart", "off")
   }
   Remove-Item -Recurse -Force $dest -ErrorAction SilentlyContinue
   Remove-Item -Force $link, $dlink -ErrorAction SilentlyContinue
-  Write-Host "Removed Limitline, its Start-menu shortcut, startup entry and status-line hook. Your settings file (~\.limitline.json) was kept."
+  if ($hook -eq 0) {
+    Write-Host "Removed Limitline, its Start-menu shortcut, startup entry and status-line hook. Your settings file (~\.limitline.json) was kept."
+  } else {
+    Write-Host "Removed Limitline, its Start-menu shortcut and startup entry. Your settings file (~\.limitline.json) was kept."
+    Write-Host "Warning: Claude Code's status-line hook may still point at the removed file. If Claude Code shows a status-line error, delete the statusLine entry from ~\.claude\settings.json."
+  }
   exit 0
 }
 
@@ -48,8 +72,7 @@ if (-not $pyDir) {
 }
 $python = Join-Path $pyDir "python.exe"
 $pythonw = Join-Path $pyDir "pythonw.exe"
-& $python -c "import tkinter" 2>$null
-if ($LASTEXITCODE -ne 0) {
+if ((Invoke-Exe $python @("-c", "import tkinter")) -ne 0) {
   Write-Host "This Python has no tkinter. Re-run the Python installer, choose Modify, and tick 'tcl/tk and IDLE'."
   exit 1
 }
@@ -64,6 +87,10 @@ else {
   Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/$Repo/main/limitline.py" -OutFile $target
 }
 
+# 2b. Application icon (the app also keeps this fresh in the accent colour on each launch)
+$icon = Join-Path $dest "limitline.ico"
+$null = Invoke-Exe $python @($target, "--write-icon", $icon)
+
 # 3. Shortcuts
 $shell = New-Object -ComObject WScript.Shell
 foreach ($p in @($link) + $(if ($Desktop) { @($dlink) } else { @() })) {
@@ -72,6 +99,7 @@ foreach ($p in @($link) + $(if ($Desktop) { @($dlink) } else { @() })) {
   $sc.Arguments = '"' + $target + '"'
   $sc.WorkingDirectory = $dest
   $sc.Description = "Floating monitor for Claude Code usage (unofficial)"
+  if (Test-Path $icon) { $sc.IconLocation = "$icon,0" }
   $sc.Save()
 }
 

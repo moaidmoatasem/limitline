@@ -38,6 +38,7 @@ Options
   --multi             allow more than one copy to run
   --install-statusline    connect live limits (edits Claude Code's settings.json, backed up)
   --uninstall-statusline  undo that
+  --verbose           print redacted diagnostics to the console
 
 Controls
   Drag the title bar to move it; double-click it (or press M / Esc) for the pill.
@@ -56,6 +57,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import locale
 import math
 import operator
 import os
@@ -63,7 +65,9 @@ import queue
 import random
 import re
 import shlex
+import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -82,15 +86,29 @@ except ImportError:  # pragma: no cover - reported in main()
 _Canvas = tk.Canvas if tk else object
 
 APP_NAME = "Limitline"
-VERSION = "2.3.3"
+VERSION = "2.8.0"
 IS_WIN = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME, ".limitline.json")
 WINDOW_SEC = 5 * 3600
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+PREPAID_URL = "https://api.anthropic.com/api/oauth/organizations/{org}/prepaid/credits"
+ORG_RE = re.compile(r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
 INSTANCE_PORT = 47613
 _LOCK = None
+VERBOSE = False
+
+
+def diag(*a):
+    """One redacted diagnostic line on stderr, only with --verbose. Never prints tokens."""
+    if not VERBOSE:
+        return
+    try:
+        print("[limitline]", *(str(x).replace(HOME, "~") for x in a), file=sys.stderr, flush=True)
+    except OSError:
+        pass
 
 # =============================================================================
 # Settings
@@ -109,10 +127,11 @@ DEFAULTS = {
     "limit_mode": "auto",       # auto (busiest past window) | custom
     "limit_value": 0.0,         # $ when metric is cost, otherwise tokens
     "refresh_sec": 15,
-    "history_days": 30,
+    "history_days": 180,        # long by default so older projects show; clamp 7-180 below
     "alerts": True,
     "alert_levels": [75, 90],           # 5-hour window
     "alert_levels_week": [50, 75, 90],  # weekly limits
+    "alert_extra_spend": [],            # extra-usage spend thresholds, same units as the feed reports (off = [])
     "alert_step": 0,                    # also alert every N% (0 = off, e.g. 25 -> 25, 50, 75, 100)
     "alert_forecast": True,             # "at this pace you'll hit the limit at ..."
     "quiet_enabled": False,
@@ -122,21 +141,41 @@ DEFAULTS = {
     "alert_sound": False,
     "mascot": "subtle",                 # off | subtle | full
     "mascot_animate": True,
+    "tray": False,                      # optional system-tray icon (needs pystray + Pillow)
+    "tray_style": "ring",               # ring (gauge arc) | dot (plain status dot)
+    "tray_fields": ["window", "week"],  # tooltip/menu lines: window | week | spend
+    "quick_action_command": "",         # shell command or argv list run on the tray menu's quick action
     "desktop_notify": True,
     "notify_reset": True,
     "welcomed": False,          # first-run welcome window has been shown
     "live_limits": True,
     "live_oauth": False,        # advanced, off by default: ask Anthropic using Claude Code's saved login
+    "live_refresh": False,      # advanced: run `claude update` when the saved login has expired (opt-in)
     "live_interval_sec": 120,
     "extra_paths": [],
     "price_overrides": {},
-    "hist_range": 14,
+    "hist_range": 30,
     "proj_range": "7d",
     "alerted": {},
     "alerts_pace_only": False,  # only alert when usage is running ahead of the clock
-    "on_alert_command": "",     # shell command run on alerts (env: LIMITLINE_EVENT/LABEL/PCT)
+    "alerts_pace_bypass": 0,    # with pace-only: levels >= this still alert when behind pace (0 = off)
+    "on_alert_command": "",     # shell command run on alerts (env: LIMITLINE_EVENT/LABEL/PCT/...)
+    "on_threshold_command": "", # like on_alert_command but not for pace forecasts
+    "on_forecast_command": "",  # only for pace-forecast alerts
     "on_reset_command": "",     # shell command run when a near-full window resets
+    "on_start_command": "",     # shell command run once when the app starts (same env; not gated by quiet hours)
 }
+
+CONFIG_ERROR = [None]  # set when the settings file was unreadable and had to be reset (shown once)
+
+
+def _stash_bad_config(path):
+    """Move an unreadable settings file aside so the next save can't silently destroy it."""
+    try:
+        os.replace(path, path + ".bad")
+        return "Your settings file couldn't be read - it was saved as " + os.path.basename(path) + ".bad and Limitline started fresh."
+    except OSError:
+        return "Your settings file couldn't be read - Limitline is running with default settings."
 
 
 def load_config(reset=False):
@@ -147,15 +186,23 @@ def load_config(reset=False):
     for path in (CONFIG_PATH, os.path.join(os.path.dirname(CONFIG_PATH), ".claude-usage-popup.json")):
         try:    # the second path is the pre-rename settings file
             with open(path, encoding="utf-8") as fh:
-                data = json.load(fh)
-            break
-        except (OSError, ValueError):
+                candidate = json.load(fh)
+        except ValueError:      # corrupt JSON: stash it now, or save_config would overwrite it later
+            if path == CONFIG_PATH:
+                CONFIG_ERROR[0] = _stash_bad_config(path)
             continue
+        except OSError:
+            continue
+        if isinstance(candidate, dict):
+            data = candidate
+            break
+        if path == CONFIG_PATH:      # valid JSON but not an object (a list, a string, ...)
+            CONFIG_ERROR[0] = _stash_bad_config(path)
     if isinstance(data, dict):
         for k, v in data.items():
-            if k not in cfg:
+            if k not in cfg and not (k.startswith("alert_levels_") and isinstance(v, list)):
                 continue
-            d = cfg[k]
+            d = cfg[k] if k in cfg else None
             if d is None or v is None or type(v) is type(d) or (isinstance(d, float) and type(v) is int):
                 cfg[k] = v
     # sanity
@@ -166,9 +213,9 @@ def load_config(reset=False):
         cfg["tab"] = "overview"
     if cfg["metric"] not in ("cost", "tokens", "io"):
         cfg["metric"] = "cost"
-    if cfg["hist_range"] not in (7, 14, 30):
-        cfg["hist_range"] = 14
-    if cfg["proj_range"] not in ("today", "7d", "30d"):
+    if cfg["hist_range"] not in (7, 30, 90, 180):
+        cfg["hist_range"] = 30
+    if cfg["proj_range"] not in ("today", "7d", "30d", "90d", "180d"):
         cfg["proj_range"] = "7d"
     try:
         cfg["alert_levels"] = sorted({min(100, max(1, int(x))) for x in cfg["alert_levels"]})
@@ -180,10 +227,32 @@ def load_config(reset=False):
         cfg["limit_value"] = 0.0
     if not isinstance(cfg["alerted"], dict):
         cfg["alerted"] = {}
+    if cfg["tray_style"] not in ("ring", "dot"):
+        cfg["tray_style"] = "ring"
+    if not isinstance(cfg["tray_fields"], list):
+        cfg["tray_fields"] = ["window", "week"]
+    cfg["tray_fields"] = [f for f in cfg["tray_fields"] if f in ("window", "week", "spend")] or ["window", "week"]
     try:
         cfg["alert_levels_week"] = sorted({min(100, max(1, int(x))) for x in cfg["alert_levels_week"]})
     except (TypeError, ValueError):
         cfg["alert_levels_week"] = [50, 75, 90]
+    try:
+        cfg["alerts_pace_bypass"] = min(100, max(0, int(cfg["alerts_pace_bypass"] or 0)))
+    except (TypeError, ValueError):
+        cfg["alerts_pace_bypass"] = 0
+    # config-file-only per-variant overrides, e.g. alert_levels_week_opus
+    for k in [k for k in cfg if k.startswith("alert_levels_") and k not in ("alert_levels", "alert_levels_week")]:
+        lv = sorted({min(100, max(1, int(x))) for x in cfg[k]
+                     if isinstance(x, (int, float)) and not isinstance(x, bool)}) \
+            if isinstance(cfg[k], list) else []
+        if lv:
+            cfg[k] = lv
+        else:
+            del cfg[k]
+    try:
+        cfg["alert_extra_spend"] = sorted({min(100000, max(1, int(float(x)))) for x in cfg["alert_extra_spend"]})
+    except (TypeError, ValueError):
+        cfg["alert_extra_spend"] = []
     try:
         step = int(cfg["alert_step"])
     except (TypeError, ValueError):
@@ -239,15 +308,26 @@ def fmt_tokens(n):
         return f"{n / 1e6:.1f}M"
     if a >= 1e6:
         return f"{n / 1e6:.2f}M"
-    if a >= 1e5:
-        return f"{n / 1e3:.0f}k"
     if a >= 1e3:
-        return f"{n / 1e3:.1f}k"
+        k = round(n / 1e3, 1 if a < 1e5 else 0)
+        if abs(k) >= 1000:        # 999,999 rounds to 1000k -> say 1.00M instead
+            return f"{n / 1e6:.2f}M"
+        return f"{k:g}k"
     return f"{n:.0f}"
+
+
+def fmt_exact_tokens(n):
+    """Comma-separated whole tokens: 1,843,291 (no rounding)."""
+    try:
+        return f"{int(round(float(n or 0))):,}"
+    except (TypeError, ValueError):
+        return "0"
 
 
 def fmt_cost(c):
     c = float(c or 0)
+    if c < 0:
+        return "-" + fmt_cost(-c)
     if c == 0:
         return "$0"
     if c < 0.01:
@@ -257,15 +337,46 @@ def fmt_cost(c):
     return f"${c:,.0f}"
 
 
+def fmt_exact_cost(c):
+    """Full-precision dollars for side-by-side comparisons: $0.2753, $179.2136."""
+    c = float(c or 0)
+    sign = "-" if c < 0 else ""
+    a = abs(c)
+    if a == 0:
+        return "$0"
+    if a < 1:
+        return f"{sign}${a:.6f}".rstrip("0") if f"{a:.6f}" != "0.000000" else f"{sign}${a:.6f}"
+    if a < 1000:
+        return f"{sign}${a:,.4f}"
+    return f"{sign}${a:,.2f}"
+
+
+def fmt_pct(p):
+    """Percent with a decimal only when it carries information: 42% / 42.4%."""
+    if p is None:
+        return "—"
+    p = float(p)
+    whole = round(p)
+    if abs(p - whole) < 0.05:
+        return f"{whole:.0f}%"
+    return f"{p:.1f}%"
+
+
 def fmt_metric(v, metric):
     return fmt_cost(v) if metric == "cost" else fmt_tokens(v)
 
 
 def fmt_axis(v, metric):
     if metric == "cost":
-        if v >= 10:
-            return f"${v:,.0f}"
-        return "$" + f"{v:.2f}".rstrip("0").rstrip(".")
+        if v == 0:
+            return "$0"
+        sign = "-" if v < 0 else ""
+        a = abs(v)
+        if a >= 10:
+            return f"{sign}${a:,.0f}"
+        if a < 1:
+            return sign + "$" + f"{a:.4f}".rstrip("0").rstrip(".")
+        return sign + "$" + f"{a:.2f}".rstrip("0").rstrip(".")
     if v >= 1e9:
         return f"{v / 1e9:g}B"
     if v >= 1e6:
@@ -531,6 +642,68 @@ def log_roots(extra=()):
     return out
 
 
+def _cli_version(text):
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text or "")
+    return ".".join(g for g in m.groups() if g is not None) if m else ""
+
+
+def _vkey(ver):
+    return tuple(int(g) for g in re.findall(r"\d+", ver or "")[:3])
+
+
+def _ext_version(ext_dir):
+    """Newest claude-code extension version under an editor's extensions folder (or '')."""
+    best = ""
+    try:
+        names = os.listdir(ext_dir)
+    except OSError:
+        return ""
+    for n in names:
+        if "claude-code" not in n.lower():
+            continue
+        ver = ""
+        pj = os.path.join(ext_dir, n, "package.json")
+        try:
+            with open(pj, encoding="utf-8") as fh:
+                data = json.load(fh)
+            ver = str(data.get("version") or "") if isinstance(data, dict) else ""
+        except (OSError, ValueError):
+            ver = _cli_version(n.rsplit("-", 1)[-1])
+        if ver and (not best or _vkey(ver) > _vkey(best)):
+            best = ver
+    return best
+
+
+def claude_installs(run=None, home=None):
+    """[(label, version)] for Claude Code installs found on this machine (read-only probes).
+
+    Never raises; anything slow or missing is simply omitted. WSL installs are not visible
+    from Windows, so they are documented, not probed.
+    """
+    if run is None:
+        def run(cmd):
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=5)
+                return _decode_out(r.stdout)
+            except (OSError, subprocess.SubprocessError):
+                return ""
+    home = home or HOME
+    found = []
+    exe = shutil.which("claude")
+    if exe:
+        try:
+            out = run([exe, "--version"])
+        except Exception:  # noqa: BLE001 - a probe must never raise
+            out = ""
+        found.append(("Claude Code", _cli_version(out) or "installed"))
+    for label, sub in (("VS Code ext", os.path.join(".vscode", "extensions")),
+                       ("Cursor ext", os.path.join(".cursor", "extensions"))):
+        ver = _ext_version(os.path.join(home, sub))
+        if ver:
+            found.append((label, ver))
+    return found
+
+
 _TS = operator.attrgetter("ts")
 
 
@@ -612,6 +785,18 @@ def write_logcheck(max_files=8):
     return out
 
 
+# A session opened inside a Claude Code worktree belongs to the repo it was made from, not to the
+# random worktree name, so projects group correctly. A cwd nested two generic folders deep (src,
+# web, ...) is a subfolder of the project under the user's home, so it keeps that name too. Results
+# are cached: this runs once per log line.
+_WT_RE = re.compile(r"[/\\]\.claude[/\\]worktrees[/\\]([^/\\]+)")
+_HOME_RE = re.compile(r"(?i)[/\\](home|users)[/\\]([^/\\]+)[/\\]")
+_GENERIC_DIRS = frozenset(("src", "lib", "app", "apps", "packages", "components", "docs", "test",
+                           "tests", "build", "dist", "examples", "demo", "ui", "web", "frontend",
+                           "backend", "internal", "utils", "scripts", "tools", "assets", "static"))
+_PROJ_CACHE = {}
+
+
 class LogStore:
     demo = False
 
@@ -660,7 +845,12 @@ class LogStore:
             if rec and rec[0] == st.st_size and rec[1] == st.st_mtime:
                 continue
             start = rec[2] if rec and st.st_size >= rec[2] else 0
-            self.files[p] = [st.st_size, st.st_mtime, self._read(p, start)]
+            try:
+                pos = self._read(p, start)
+            except OSError:            # locked or vanished: remember nothing, read it fully again next scan
+                self.files.pop(p, None)
+                continue
+            self.files[p] = [st.st_size, st.st_mtime, pos]
             changed += 1
             if progress and changed % 20 == 0:
                 progress(i, len(paths))
@@ -671,20 +861,17 @@ class LogStore:
 
     def _read(self, path, start):
         pos = start
-        try:
-            with open(path, "rb") as fh:
-                if start:
-                    fh.seek(start)
-                for raw in fh:
-                    if not raw.endswith(b"\n"):
-                        break  # incomplete line - pick it up next time
-                    pos += len(raw)
-                    if b'"usage"' in raw:
-                        self._parse(raw, path)
-                    elif b'"cost-state"' in raw:
-                        self._parse_cost_state(raw)
-        except OSError:
-            pass
+        with open(path, "rb") as fh:
+            if start:
+                fh.seek(start)
+            for raw in fh:
+                if not raw.endswith(b"\n"):
+                    break  # incomplete line - pick it up next time
+                pos += len(raw)
+                if b'"usage"' in raw:
+                    self._parse(raw, path)
+                elif b'"cost-state"' in raw:
+                    self._parse_cost_state(raw)
         return pos
 
     def _parse(self, raw, path):
@@ -742,9 +929,27 @@ class LogStore:
             p = cwd.strip().rstrip("\\/")
             if os.path.normcase(os.path.normpath(p)) == os.path.normcase(os.path.normpath(HOME)):
                 return "~ (home)"
-            return sys.intern(re.split(r"[\\/]", p)[-1] or p)
+            name = _PROJ_CACHE.get(p)
+            if name is None:
+                name = LogStore._project_name(p)
+                _PROJ_CACHE[p] = name
+            return sys.intern(name)
         folder = os.path.basename(os.path.dirname(path))
         return sys.intern(folder.strip("-").split("-")[-1] or folder or "unknown")
+
+    @staticmethod
+    def _project_name(p):
+        m = _WT_RE.search(p)
+        if m:
+            return os.path.basename(p[:m.start()].rstrip("\\/")) or os.path.basename(p)
+        segs = [s for s in re.split(r"[\\/]+", p) if s]
+        if len(segs) >= 2 and segs[-1].lower() in _GENERIC_DIRS and segs[-2].lower() in _GENERIC_DIRS:
+            h = _HOME_RE.search(p + "/")
+            if h:
+                top = re.split(r"[\\/]+", p[h.end():])[0]
+                if top:
+                    return top
+        return os.path.basename(p) or p
 
     def entries(self, since):
         es = [e for e in self.by_key.values() if e.ts >= since]
@@ -861,7 +1066,28 @@ def _write_json_atomic(path, data):
 
 
 def _shell_join(parts):
-    return subprocess.list2cmdline(parts) if IS_WIN else " ".join(shlex.quote(x) for x in parts)
+    if not IS_WIN:
+        return " ".join(shlex.quote(x) for x in parts)
+    # list2cmdline only quotes on whitespace, but cmd.exe also splits on & | < > ^ % ( ) !
+    # even without spaces - quote anything that trips cmd.exe, escaping like the MSVC CRT.
+    out = []
+    for a in parts:
+        if a and not re.search(r'[\s"&|<>^%!()]', a):
+            out.append(a)
+            continue
+        buf, backslashes = ['"'], 0
+        for ch in a:
+            if ch == "\\":
+                backslashes += 1
+                continue
+            if ch == '"':
+                buf.append("\\" * (backslashes * 2 + 1) + '"')
+            else:
+                buf.append("\\" * backslashes + ch)
+            backslashes = 0
+        buf.append("\\" * (backslashes * 2) + '"')
+        out.append("".join(buf))
+    return " ".join(out)
 
 
 def _status_python():
@@ -885,12 +1111,44 @@ def statusline_command(chain=None, config_dir=None):
     return _shell_join(parts)
 
 
+def _stdin_text():
+    """Claude Code pipes UTF-8; the console's codepage (cp1252 on Windows) must not get a vote."""
+    try:
+        buf = getattr(sys.stdin, "buffer", None)
+        if buf is not None:
+            return buf.read().decode("utf-8", "replace")
+        return sys.stdin.read() if sys.stdin else ""
+    except (OSError, ValueError):
+        return ""
+
+
+def _decode_out(data):
+    if isinstance(data, str):
+        return data
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:      # a chain wrote in the console's own codepage
+        return data.decode(locale.getpreferredencoding(False) or "utf-8", "replace")
+
+
+def _stdout_write(text):
+    """Claude Code decodes our stdout as UTF-8; sys.stdout's cp1252 would turn '·' into garbage."""
+    try:
+        if not sys.stdout:
+            return
+        buf = getattr(sys.stdout, "buffer", None)
+        if buf is not None:
+            buf.write(text.encode("utf-8", "replace"))
+            buf.flush()
+        else:
+            sys.stdout.write(text)
+    except (OSError, ValueError, UnicodeError):
+        pass
+
+
 def run_statusline(chain=None):
     """Claude Code status-line command: save rate_limits, print one short line (or the chained command's)."""
-    try:
-        raw = sys.stdin.read() if sys.stdin else ""
-    except (OSError, ValueError):
-        raw = ""
+    raw = _stdin_text()
     try:
         d = json.loads(raw)
     except ValueError:
@@ -906,8 +1164,9 @@ def run_statusline(chain=None):
     out = ""
     if chain:
         try:
-            r = subprocess.run(chain, shell=True, input=raw, capture_output=True, text=True, timeout=5)
-            out = r.stdout
+            r = subprocess.run(chain, shell=True, input=raw.encode("utf-8", "replace"),
+                               capture_output=True, timeout=5)
+            out = _decode_out(r.stdout)
         except (OSError, subprocess.SubprocessError):
             out = ""
     elif isinstance(d, dict):
@@ -916,10 +1175,9 @@ def run_statusline(chain=None):
         for key, tag in (("five_hour", "5h"), ("seven_day", "7d")):
             v = (rl.get(key) or {}).get("used_percentage")
             if isinstance(v, (int, float)):
-                bits.append(f"{tag} {v:.0f}%")
+                bits.append(f"{tag} {fmt_pct(v)}")
         out = " · ".join(bits)
-    if sys.stdout:
-        sys.stdout.write(out)
+    _stdout_write(out)
     try:
         lc = logcheck_path()
         if not os.path.exists(lc) or time.time() - os.path.getmtime(lc) > 3600:
@@ -950,6 +1208,12 @@ def _chain_of(cmd):
     return rest or None
 
 
+def _ours_statusline(cmd):
+    """True when this status-line command is ours - not some other tool that also uses --statusline."""
+    s = str(cmd)
+    return "--statusline" in s and ("limitline" in s.lower() or " --then " in s)
+
+
 def install_statusline(config_dir=None):
     """Point Claude Code's status line at us (keeping any existing one running). -> message"""
     sp = claude_settings_path()
@@ -963,7 +1227,7 @@ def install_statusline(config_dir=None):
     except (OSError, ValueError):
         return False, f"Couldn't read {sp}; left untouched."
     cur = data.get("statusLine")
-    if isinstance(cur, dict) and "--statusline" in str(cur.get("command", "")):
+    if isinstance(cur, dict) and _ours_statusline(cur.get("command", "")):
         old = str(cur.get("command", ""))
         fresh = statusline_command(_chain_of(old), config_dir)
         if old == fresh:
@@ -1016,13 +1280,16 @@ def statusline_connected():
     try:
         with open(claude_settings_path(), encoding="utf-8") as fh:
             cmd = (json.load(fh).get("statusLine") or {}).get("command", "")
-        return "--statusline" in str(cmd)
+        return _ours_statusline(cmd)
     except (OSError, ValueError, AttributeError):
         return False
 
 
 def read_bridge(now=None):
-    """-> (items, written_at) from the status-line file, or None. Expired windows are dropped."""
+    """-> (items, written_at) from the status-line file, or None. Expired windows are dropped.
+
+    Unknown rate_limits keys are kept with a generated label and ordered last -
+    a future quota type stays visible instead of silently disappearing."""
     now = now or time.time()
     try:
         with open(live_file_path(), encoding="utf-8") as fh:
@@ -1032,15 +1299,15 @@ def read_bridge(now=None):
         return None
     items = []
     if isinstance(rl, dict):
-        for key in ("five_hour", "seven_day"):
-            w = rl.get(key)
+        for key, w in rl.items():
             if not isinstance(w, dict) or not isinstance(w.get("used_percentage"), (int, float)):
                 continue
-            rs = w.get("resets_at")
-            rs = float(rs) if isinstance(rs, (int, float)) and not isinstance(rs, bool) else None
+            rs = parse_ts(w.get("resets_at"))
             if rs is not None and rs <= now:
                 continue            # that window has ended; Claude Code drops it too
-            items.append({"key": key, "label": LIVE_LABELS[key], "pct": float(w["used_percentage"]), "resets": rs})
+            items.append({"key": key, "label": LIVE_LABELS.get(key, key.replace("_", " ").capitalize()),
+                          "pct": float(w["used_percentage"]), "resets": rs})
+        items.sort(key=lambda it: LIVE_ORDER.index(it["key"]) if it["key"] in LIVE_ORDER else 99)
     return items, ts
 
 
@@ -1081,12 +1348,114 @@ def plan_label(sub, tier):
     return f"{label} {m.group(1)}x" if m else label
 
 
+def normalize_prepaid(data):
+    """Prepaid-credits response -> {'amount': major units, 'currency': str|None, 'decimals': int} or None.
+
+    The live payload carries the money in ``balance.money`` when present and otherwise in
+    ``balance.credits`` (a real account with no balance returns ``money: null``), so both are
+    read, with the top-level ``currency`` and an exponent of 2 as fallbacks. Any unexpected
+    shape means the account has no prepaid credits; callers hide the line entirely."""
+    if not isinstance(data, dict):
+        return None
+    amount = data.get("amount")
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        return None
+    balance = data.get("balance")
+    balance = balance if isinstance(balance, dict) else {}
+    money = balance.get("money") if isinstance(balance.get("money"), dict) else None
+    credits = balance.get("credits") if isinstance(balance.get("credits"), dict) else None
+    src = money or credits or {}
+    currency = src.get("currency") or data.get("currency")
+    exp = src.get("exponent")
+    decimals = exp if isinstance(exp, int) and not isinstance(exp, bool) else 2
+    return {"amount": float(amount) / (10 ** decimals), "currency": currency if isinstance(currency, str) else None,
+            "decimals": decimals}
+
+
+def prepaid_text(prepaid):
+    """'Prepaid credits $123.45' line for the limits card, or '' when unavailable."""
+    if not prepaid or not isinstance(prepaid.get("amount"), (int, float)):
+        return ""
+    cur = prepaid.get("currency") or ""
+    dec = prepaid.get("decimals")
+    dec = dec if isinstance(dec, int) and not isinstance(dec, bool) else 2
+    return f"Prepaid credits {cur} {prepaid['amount']:,.{dec}f}".replace("  ", " ")
+
+
+def model_slug(name):
+    """'Fable' -> 'fable'; 'Sonnet 4.5' -> 'sonnet_4_5' - a field-name suffix for a model."""
+    cleaned = "".join(ch if ch.isalnum() else " " for ch in str(name).lower())
+    return "_".join(cleaned.split())
+
+
+def merge_scoped_limits(js):
+    """Expose model-scoped limits from the `limits` array as synthetic quota fields.
+
+    Newer usage responses carry per-model weekly limits only inside the `limits`
+    array (via scope.model), no longer as top-level fields like seven_day_sonnet.
+    Each active scoped limit is mapped onto a synthetic field the existing parsing
+    already understands. The period prefix is derived from the response, not
+    assumed: the non-scoped limit of the same group shares its resets_at with an
+    existing top-level quota field, whose name supplies the prefix (a weekly
+    limit scoped to Fable becomes seven_day_fable). Inactive scoped limits (no
+    reset window) are surfaced at 0% so the limit is visible before first use;
+    an existing top-level field is never overwritten (it carries
+    higher-precision data)."""
+    limits = js.get("limits")
+    if not isinstance(limits, list):
+        return js
+    reset_to_field = {}
+    for key, value in js.items():
+        if isinstance(value, dict) and isinstance(value.get("utilization"), (int, float)):
+            rs = value.get("resets_at")
+            if rs:
+                reset_to_field.setdefault(rs, key)
+    group_prefix = {}
+    for limit in limits:
+        if not isinstance(limit, dict) or limit.get("scope"):
+            continue
+        group, rs = limit.get("group"), limit.get("resets_at")
+        if group and rs and rs in reset_to_field:
+            group_prefix.setdefault(group, reset_to_field[rs])
+    merged = dict(js)
+    for limit in limits:
+        if not isinstance(limit, dict):
+            continue
+        scope = limit.get("scope")
+        model = scope.get("model") if isinstance(scope, dict) else None
+        display_name = model.get("display_name") if isinstance(model, dict) else None
+        prefix = group_prefix.get(limit.get("group"))
+        if not display_name or not prefix:
+            continue
+        field = "%s_%s" % (prefix, model_slug(display_name))
+        if merged.get(field) is not None:
+            continue
+        pct = limit.get("percent")
+        merged[field] = {"utilization": float(pct) if isinstance(pct, (int, float)) else 0.0,
+                         "resets_at": limit.get("resets_at")}
+    return merged
+
+
+def _active_quota(key, v):
+    """Does an /usage entry describe a limit that actually applies to the account?
+
+    The OAuth response lists experiment code names (e.g. ``nimbus_quill``) as quota
+    objects with a utilization of 0 and no reset window; those are not real limits and
+    must not show up as a phantom 0%. A real limit either carries a reset window or has
+    a name we understand (``five_hour`` / ``seven_day`` and its variants, including the
+    synthetic fields made by ``merge_scoped_limits``)."""
+    if not isinstance(v, dict) or not isinstance(v.get("utilization"), (int, float)):
+        return False
+    return bool(v.get("resets_at")) or key == "five_hour" or key.startswith("seven_day")
+
+
 def parse_live(js):
     items = []
     if not isinstance(js, dict):
         return items, None
+    js = merge_scoped_limits(js)
     for k, v in js.items():
-        if isinstance(v, dict) and isinstance(v.get("utilization"), (int, float)):
+        if _active_quota(k, v):
             items.append({"key": k, "label": LIVE_LABELS.get(k, k.replace("_", " ").capitalize()),
                           "pct": float(v["utilization"]), "resets": parse_ts(v.get("resets_at"))})
     items.sort(key=lambda it: LIVE_ORDER.index(it["key"]) if it["key"] in LIVE_ORDER else 99)
@@ -1095,7 +1464,11 @@ def parse_live(js):
     if isinstance(ex, dict) and ex.get("is_enabled"):
         lim, used = ex.get("monthly_limit"), ex.get("used_credits")
         ok = isinstance(lim, (int, float)) and lim > 0 and isinstance(used, (int, float))
-        extra = {"pct": used / lim * 100.0 if ok else None}
+        cur = ex.get("currency")
+        extra = {"pct": used / lim * 100.0 if ok else None,
+                 "used": float(used) if isinstance(used, (int, float)) else None,
+                 "limit": float(lim) if isinstance(lim, (int, float)) and lim > 0 else None,
+                 "currency": cur if isinstance(cur, str) else None}
     return items, extra
 
 
@@ -1112,12 +1485,87 @@ def http_get_json(url, headers, timeout=10):
         return json.loads(r.read().decode("utf-8"))
 
 
+def oauth_headers(oauth):
+    """Auth headers for the OAuth API - the token only ever goes to api.anthropic.com."""
+    return {"Authorization": "Bearer " + str(oauth["accessToken"]),
+            "anthropic-beta": "oauth-2025-04-20",
+            "Accept": "application/json",
+            "User-Agent": f"limitline/{VERSION}"}
+
+
+def _parse_retry_after(ex):
+    """Seconds from a Retry-After header on an HTTPError, or None."""
+    try:
+        raw = ex.headers.get("Retry-After") if ex.headers else None
+        return max(0, int(raw)) if raw is not None else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _server_message(ex):
+    """error.message from a JSON error body, minus the redundant retry advice."""
+    try:
+        msg = (json.loads(ex.read().decode("utf-8", "replace")).get("error") or {}).get("message") or ""
+    except (ValueError, AttributeError):
+        return None
+    for suffix in (" Please try again later.", " Please try again later"):
+        if msg.endswith(suffix):
+            msg = msg[:-len(suffix)]
+    return msg.strip() or None
+
+
+def os_idle_seconds():
+    """Seconds since the last keyboard/mouse input (None when unknown).
+
+    Windows only for now; anything else returns None and polling behaves as before.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        class _LII(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_ulong)]
+
+        lii = _LII()
+        lii.cbSize = ctypes.sizeof(lii)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+            return None
+        return max(0.0, (ctypes.windll.kernel32.GetTickCount() - lii.dwTime) / 1000.0)
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def live_interval(cfg, last_ts, now, items, state, idle_sec=None):
+    """Seconds until the next live-limit check (pure).
+
+    Faster while Claude is actively used, slower when its logs go stale, aligned to
+    imminent quota resets, quick for the local status-line file, and at most every
+    15 minutes when nobody has touched the keyboard for a while.
+    """
+    interval = max(30, int(cfg.get("live_interval_sec", 120) or 120))
+    # Handle clock skew: if now < last_ts, treat as stale
+    if last_ts and now >= last_ts and now - last_ts < 600:
+        interval = min(interval, 60)
+    elif not last_ts or now < last_ts or now - last_ts > 3600:
+        interval = max(interval, 300)
+    if idle_sec is not None and idle_sec > 900:
+        interval = max(interval, 900)
+    resets = [it["resets"] for it in items or [] if it.get("resets") and it["resets"] > now]
+    if resets:
+        interval = min(interval, max(5, min(resets) - now + 5))
+    if state.get("source") == "statusline" or state.get("status") in ("nobridge", "wait"):
+        interval = min(interval, 10)    # the file is local and tiny: pick up changes quickly
+    return interval
+
+
 class LiveLimits:
     def __init__(self, app):
         self.app = app
         self.state = {"status": "idle"}
         self.lock = threading.Lock()
         self.wake = threading.Event()
+        self.fails = 0          # consecutive failed fetches -> exponential backoff (60s..900s)
 
     def get(self):
         with self.lock:
@@ -1126,8 +1574,10 @@ class LiveLimits:
     def fetch(self):
         """Official status-line data first; the saved login is used only if the user opted in."""
         b = read_bridge()
+        diag("bridge:", "none" if b is None else f"{len(b[0])} items, written {int(time.time() - b[1])}s ago")
         if self.app.cfg.get("live_oauth") and not (b and b[0] and time.time() - b[1] <= 900):
             st = self.fetch_oauth()
+            diag("oauth:", st.get("status"), st.get("msg") or "", "retry_after" if st.get("retry_after") else "")
             try:
                 _write_json_atomic(os.path.join(os.path.dirname(CONFIG_PATH), ".limitline-login-check.json"),
                                    {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "status": st.get("status"),
@@ -1152,39 +1602,113 @@ class LiveLimits:
         return self.fetch_oauth()
 
     def fetch_oauth(self):
-        oauth = read_credentials()
-        if not oauth or not oauth.get("accessToken"):
-            return {"status": "nologin", "msg": "No Claude Code login found on this computer."}
-        plan = plan_label(oauth.get("subscriptionType"), oauth.get("rateLimitTier"))
-        exp = oauth.get("expiresAt")
-        if isinstance(exp, (int, float)) and exp / 1000.0 < time.time():
-            return {"status": "expired", "plan": plan,
-                    "msg": "Saved login has expired. Open Claude Code once to refresh it."}
+        for attempt in (0, 1):
+            oauth = read_credentials()
+            if not oauth or not oauth.get("accessToken"):
+                return {"status": "nologin", "msg": "No Claude Code login found on this computer."}
+            plan = plan_label(oauth.get("subscriptionType"), oauth.get("rateLimitTier"))
+            exp = oauth.get("expiresAt")
+            if isinstance(exp, (int, float)) and exp / 1000.0 < time.time():
+                if attempt == 0 and self._refresh_now():
+                    continue      # `claude update` rewrote the credentials file; re-read and retry once
+                return {"status": "expired", "plan": plan,
+                        "msg": "Saved login has expired. Open Claude Code once to refresh it."}
+            try:
+                js = http_get_json(USAGE_URL, oauth_headers(oauth))
+            except urllib.error.HTTPError as ex:
+                detail = _server_message(ex)
+                if ex.code in (401, 403):
+                    if attempt == 0 and self._refresh_now():
+                        continue
+                    return {"status": "auth", "plan": plan,
+                            "msg": detail or f"Plan limits aren't available for this login (HTTP {ex.code})."}
+                if ex.code == 429:
+                    st = {"status": "rate", "plan": plan,
+                          "msg": detail or "Rate-limited; will retry in a few minutes."}
+                    ra = _parse_retry_after(ex)
+                    if ra is not None:
+                        st["retry_after"] = ra
+                    return st
+                if 500 <= ex.code < 600:
+                    return {"status": "error", "plan": plan,
+                            "msg": detail or f"Anthropic had a problem (HTTP {ex.code}); will retry."}
+                return {"status": "error", "plan": plan, "msg": detail or f"Anthropic returned HTTP {ex.code}."}
+            except urllib.error.URLError as ex:
+                reason = getattr(ex, "reason", None)
+                if isinstance(reason, ssl.SSLCertVerificationError):
+                    return {"status": "cert", "plan": plan,
+                            "msg": "Secure connection failed (certificate check)."}
+                return {"status": "offline", "plan": plan, "msg": "Couldn't reach Anthropic - showing local data."}
+            except Exception:  # noqa: BLE001 - offline, DNS, TLS, bad JSON ...
+                return {"status": "offline", "plan": plan, "msg": "Couldn't reach Anthropic - showing local data."}
+            items, extra = parse_live(js)
+            if not items:
+                return {"status": "error", "plan": plan, "msg": "No limit data in the response."}
+            st = {"status": "ok", "plan": plan, "items": items, "extra": extra, "fetched": time.time()}
+            prof = self._profile_for(oauth["accessToken"])
+            if prof.get("email"):
+                st["email"] = prof["email"]   # memory only - the settings file never sees it
+            if extra is not None:
+                st["prepaid"] = self._prepaid_for(oauth["accessToken"], prof.get("org"))
+            return st
+        return {"status": "auth", "msg": "Login still rejected after a refresh attempt."}
+
+    def _refresh_now(self):
+        """Opt-in (live_refresh): run `claude update` so the CLI renews the saved login. At most once an hour."""
+        if not self.app.cfg.get("live_refresh"):
+            return False
+        now = time.time()
+        if now - getattr(self, "_last_refresh", 0.0) < 3600:
+            return False
+        self._last_refresh = now
+        cli = shutil.which("claude")
+        if not cli:
+            diag("refresh", "claude CLI not found on PATH")
+            return False
         try:
-            js = http_get_json(USAGE_URL, {
-                "Authorization": "Bearer " + str(oauth["accessToken"]),
-                "anthropic-beta": "oauth-2025-04-20",
-                "Accept": "application/json",
-                "User-Agent": f"limitline/{VERSION}",
-            })
-        except urllib.error.HTTPError as ex:
-            if ex.code in (401, 403):
-                return {"status": "auth", "plan": plan,
-                        "msg": f"Plan limits aren't available for this login (HTTP {ex.code})."}
-            if ex.code == 429:
-                return {"status": "rate", "plan": plan, "msg": "Rate-limited; will retry in a few minutes."}
-            return {"status": "error", "plan": plan, "msg": f"Anthropic returned HTTP {ex.code}."}
-        except Exception:  # noqa: BLE001 - offline, DNS, TLS, bad JSON ...
-            return {"status": "offline", "plan": plan, "msg": "Couldn't reach Anthropic - showing local data."}
-        items, extra = parse_live(js)
-        if not items:
-            return {"status": "error", "plan": plan, "msg": "No limit data in the response."}
-        return {"status": "ok", "plan": plan, "items": items, "extra": extra, "fetched": time.time()}
+            r = subprocess.run([cli, "update"], capture_output=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as ex:
+            diag("refresh", f"claude update failed: {type(ex).__name__}")
+            return False
+        diag("refresh", f"claude update exit {r.returncode}")
+        return r.returncode == 0
+
+    def _profile_for(self, token):
+        """Account email + validated org uuid, memoized per token. Supplementary; never persisted."""
+        if getattr(self, "_profile_token", None) == token:
+            return getattr(self, "_profile_cache", {}) or {}
+        self._profile_token, self._profile_cache = token, {}
+        try:
+            js = http_get_json(PROFILE_URL, oauth_headers({"accessToken": token}))
+            acct = (js or {}).get("account") if isinstance(js, dict) else None
+            email = acct.get("email") if isinstance(acct, dict) else None
+            org = (js or {}).get("organization") if isinstance(js, dict) else None
+            org = org.get("uuid") if isinstance(org, dict) else None
+            self._profile_cache = {"email": email if isinstance(email, str) and email else None,
+                                   "org": org if isinstance(org, str) and ORG_RE.match(org) else None}
+        except Exception:  # noqa: BLE001 - the profile is supplementary; usage never waits on it
+            pass
+        return self._profile_cache
+
+    def _prepaid_for(self, token, org):
+        """Prepaid-credit balance, refetched at most every 30 minutes; any failure hides the line."""
+        now = time.time()
+        if now - getattr(self, "_prepaid_at", 0.0) < 1800:
+            return getattr(self, "_prepaid_cache", None)
+        self._prepaid_at = now
+        self._prepaid_cache = None
+        if not isinstance(org, str) or not ORG_RE.match(org):
+            return None
+        try:
+            self._prepaid_cache = normalize_prepaid(
+                http_get_json(PREPAID_URL.format(org=org), oauth_headers({"accessToken": token})))
+        except Exception:  # noqa: BLE001
+            pass
+        return self._prepaid_cache
 
     def loop(self):
         while True:
             cfg = self.app.cfg
-            interval = max(30, int(cfg.get("live_interval_sec", 120)))
             if cfg.get("live_limits", True) and not self.app.args.no_live:
                 st = self.fetch()
                 with self.lock:
@@ -1193,26 +1717,27 @@ class LiveLimits:
                             and time.time() - prev.get("fetched", 0) < 900):
                         st = dict(prev, status="stale", msg=st.get("msg"))
                     self.state = st
-                if st["status"] == "rate":
-                    interval = max(interval, 300)
             else:
+                st = {"status": "off"}
                 with self.lock:
-                    self.state = {"status": "off"}
+                    self.state = st
             self.app.worker.wake.set()
             # adaptive: faster while you're actively using Claude, slower when idle,
             # and always re-check right after a limit resets
             snap = self.app.snap or {}
             last = snap.get("last_ts")
             now = time.time()
-            if last and now - last < 600:
-                interval = min(interval, 60)
-            elif not last or now - last > 3600:
-                interval = max(interval, 300)
-            resets = [it["resets"] for it in (self.state.get("items") or []) if it.get("resets") and it["resets"] > now]
-            if resets:
-                interval = min(interval, max(5, min(resets) - now + 5))
-            if self.state.get("source") == "statusline" or self.state.get("status") in ("nobridge", "wait"):
-                interval = min(interval, 10)    # the file is local and tiny: pick up changes quickly
+            interval = live_interval(cfg, last, now, self.state.get("items"),
+                                     self.state, os_idle_seconds())
+            # failed fetches back off exponentially (60s .. 900s); a 429's Retry-After wins
+            if st["status"] in ("rate", "error", "offline", "cert"):
+                self.fails += 1
+                ra = st.get("retry_after")
+                wait = min(900, max(30, int(ra))) if isinstance(ra, (int, float)) and ra > 0 \
+                    else min(900, 60 * (2 ** (self.fails - 1)))
+                interval = max(interval, wait)
+            else:
+                self.fails = 0
             self.wake.wait(interval)
             self.wake.clear()
 
@@ -1228,8 +1753,8 @@ class DemoLive:
         now = time.time()
         reset5 = math.floor(now / 3600) * 3600 + 3600 * 2 + 1800
         today = local_day(now)
-        monday = today + (7 - date.fromordinal(today).weekday()) % 7 or today + 7
-        reset7 = day_start(monday) + 9 * 3600
+        off = (7 - date.fromordinal(today).weekday()) % 7 or 7   # next Monday (a week ahead when today is Monday)
+        reset7 = day_start(today + off) + 9 * 3600
         return {"status": "ok", "plan": None, "fetched": now - 40, "extra": None, "items": [
             {"key": "five_hour", "label": LIVE_LABELS["five_hour"], "pct": 64.0, "resets": reset5},
             {"key": "seven_day", "label": LIVE_LABELS["seven_day"], "pct": 38.0, "resets": reset7},
@@ -1242,8 +1767,13 @@ class DemoLive:
 # =============================================================================
 # Alert rules (pure functions, no UI)
 # =============================================================================
-def alert_levels_for(cfg, scope):
+def alert_levels_for(cfg, scope, variant=None):
+    """Levels for a scope; week variants (e.g. 'opus') can override via alert_levels_week_<variant>."""
     base = cfg.get("alert_levels") if scope == "session" else cfg.get("alert_levels_week")
+    if scope != "session" and variant:
+        ov = cfg.get("alert_levels_week_" + variant)
+        if isinstance(ov, list):
+            base = ov
     levels = set()
     for x in base or []:
         if isinstance(x, int) and not isinstance(x, bool) and 0 < x <= 100:
@@ -1283,27 +1813,52 @@ def plan_alerts(cfg, s, alerted, now):
         return events
     w, g = s["window"], s["gauge"]
     pace_only = cfg.get("alerts_pace_only")
-    checks = []   # (key, scope, pct, label, reset, elapsed)
+    checks = []   # (key, scope, pct, label, reset, elapsed, variant)
     if w and g["pct"] is not None:
-        checks.append(("w%d" % int(w["end"]), "session", g["pct"], "Your 5-hour window", w["end"], w["elapsed"]))
+        checks.append(("w%d" % int(w["end"]), "session", g["pct"], "Your 5-hour window", w["end"], w["elapsed"], None))
     if s["live"].get("status") in ("ok", "stale"):
         for it in s["live"].get("items") or []:
             if it["key"] == "five_hour":
                 continue
             rs = it["resets"]
             el = min(1.0, max(0.0, 1 - ((rs or now) - now) / (7 * 86400.0)))
-            checks.append(("%s:%d" % (it["key"], int(rs or 0)), "week", it["pct"], it["label"], rs, el))
-    for key, scope, pct, label, reset, elapsed in checks:
-        levels = alert_levels_for(cfg, scope)
-        if not levels or (pace_only and not pct / 100.0 > elapsed):
+            variant = it["key"][len("seven_day_"):] if it["key"].startswith("seven_day_") else None
+            checks.append(("%s:%d" % (it["key"], int(rs or 0)), "week", it["pct"], it["label"], rs, el, variant))
+    for key, scope, pct, label, reset, elapsed, variant in checks:
+        levels = alert_levels_for(cfg, scope, variant)
+        if not levels:
             continue
+        if pace_only and not pct / 100.0 > elapsed:
+            bypass = cfg.get("alerts_pace_bypass") or 0
+            if not (isinstance(bypass, int) and 0 < bypass <= 100):
+                continue
+            levels = [lv for lv in levels if lv >= bypass]
+            if not levels:
+                continue
         done = set(alerted.get(key, []))
         hit = [lv for lv in levels if pct >= lv and lv not in done]
         if hit:
             alerted[key] = sorted(done | set(hit))
             tail = f" · resets {fmt_when(reset, now)}" if reset else ""
             events.append({"kind": "threshold", "scope": scope, "level": max(hit), "pct": pct, "label": label,
-                           "text": f"{label} is at {pct:.0f}%{tail}", "title": f"Limitline · {max(hit)}%"})
+                           "text": f"{label} is at {fmt_pct(pct)}{tail}", "title": f"Limitline · {max(hit)}%"})
+    # extra-usage spend: absolute thresholds in the feed's reported units, once per calendar month.
+    # Extra usage has no monthly cap to pace against, so percentages can't do this job. The feed's
+    # unit is taken as-is (no dollars conversion); the setting stays empty until the user calibrates it.
+    spend = cfg.get("alert_extra_spend") or []
+    exu = (s.get("live") or {}).get("extra") or {}
+    used = exu.get("used")
+    if spend and isinstance(used, (int, float)) and not isinstance(used, bool):
+        lt = time.localtime(now)
+        skey = "x:%d-%02d" % (lt.tm_year, lt.tm_mon)
+        done = set(alerted.get(skey, []))
+        hit = [t for t in spend if used >= t and t not in done]
+        if hit:
+            alerted[skey] = sorted(done | set(hit))
+            events.append({"kind": "spend", "scope": "extra", "level": 75, "pct": exu.get("pct"),
+                           "label": "Extra usage spend",
+                           "text": f"Extra usage spend reached {used:,.0f} (threshold {max(hit):,})",
+                           "title": f"Limitline · extra spend {max(hit):,}"})
     # forecast: you will run out before the window resets, and you've really started using it
     eta = g.get("eta")
     if cfg.get("alert_forecast") and w and eta and g["pct"] is not None and 20 <= g["pct"] < 100 \
@@ -1319,6 +1874,66 @@ def plan_alerts(cfg, s, alerted, now):
     while len(alerted) > 60:
         alerted.pop(next(iter(alerted)))
     return events
+
+
+def hook_env(live, event, label, pct):
+    """Environment variables for hook commands. Never tokens or message text; unknown values are omitted."""
+    env = {"LIMITLINE_EVENT": str(event or ""), "LIMITLINE_LABEL": str(label or ""),
+           "LIMITLINE_PCT": f"{pct:.0f}" if isinstance(pct, (int, float)) and not isinstance(pct, bool) else "",
+           "LIMITLINE_VERSION": VERSION}
+    for it in (live or {}).get("items") or []:
+        k = str(it.get("key") or "").upper()
+        if not k or not isinstance(it.get("pct"), (int, float)) or isinstance(it.get("pct"), bool):
+            continue
+        env["LIMITLINE_UTILIZATION_" + k] = f"{it['pct']:.0f}"
+        rs = it.get("resets")
+        if isinstance(rs, (int, float)) and not isinstance(rs, bool):
+            env["LIMITLINE_RESETS_AT_" + k] = datetime.fromtimestamp(rs).isoformat(timespec="minutes")
+    exu = (live or {}).get("extra") or {}
+    if isinstance(exu.get("used"), (int, float)) and not isinstance(exu.get("used"), bool):
+        env["LIMITLINE_EXTRA_USED"] = f"{exu['used']:g}"
+    if isinstance(exu.get("limit"), (int, float)) and not isinstance(exu.get("limit"), bool):
+        env["LIMITLINE_EXTRA_LIMIT"] = f"{exu['limit']:g}"
+    return env
+
+
+def hook_command(cmd):
+    """A hook setting is a shell string, an argv list, or a JSON-array string; -> argv list or shell string."""
+    if isinstance(cmd, (list, tuple)):
+        return [str(x) for x in cmd]
+    cmd = str(cmd or "").strip()
+    if cmd.startswith("["):
+        try:
+            argv = json.loads(cmd)
+        except ValueError:
+            return cmd
+        if isinstance(argv, list):
+            return [str(x) for x in argv]
+    return cmd
+
+
+def run_hook_command(cmd, env=None, timeout=10):
+    """Run one hook command synchronously (Settings' Test button and tests) -> (exit code or None, output)."""
+    argv = hook_command(cmd)
+    if isinstance(argv, list):
+        if not argv:
+            return None, ""
+        parts = [argv]
+        shell = False
+    else:
+        if not argv:
+            return None, ""
+        parts, shell = [argv], True
+    try:
+        r = subprocess.run(*parts, shell=shell, env=env or dict(os.environ),
+                           capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, f"still running after {timeout}s"
+    except OSError as ex:
+        return None, str(ex)
+    out = (r.stdout or b"").decode("utf-8", "replace").strip()
+    err = (r.stderr or b"").decode("utf-8", "replace").strip()
+    return r.returncode, (out + ("\n" if out and err else "") + err)[:500]
 
 
 # =============================================================================
@@ -1339,6 +1954,21 @@ def add(agg, e):
 
 def tok(agg):
     return agg[0] + agg[1] + agg[2] + agg[3]
+
+
+def weekly_buckets(days):
+    """Group day buckets into 7-day sums so long chart ranges stay readable."""
+    out = []
+    for i in range(0, len(days), 7):
+        chunk = days[i:i + 7]
+        fam, agg = {}, [0.0] * 6
+        for b in chunk:
+            for k, v in b["fam"].items():
+                fam[k] = fam.get(k, 0.0) + v
+            for j in range(6):
+                agg[j] += b["agg"][j]
+        out.append({"day": chunk[0]["day"], "end": chunk[-1]["day"], "fam": fam, "agg": agg})
+    return out
 
 
 def mval(agg, metric):
@@ -1450,10 +2080,11 @@ def build_snapshot(entries, now, cfg, live, scan):
     s_today, s7, s30 = set(), set(), set()
     hour0 = hour_start(now) - 23 * 3600
     hourly = [{"start": hour0 + i * 3600, "fam": defaultdict(float), "agg": new_agg()} for i in range(24)]
-    daily = [{"day": today - 29 + i, "fam": defaultdict(float), "agg": new_agg()} for i in range(30)]
+    daily = [{"day": today - 179 + i, "fam": defaultdict(float), "agg": new_agg()} for i in range(180)]
+    hdays = min(180, max(7, int(cfg.get("hist_range") or 30)))
     heat = [[0.0] * 24 for _ in range(7)]
     heat_n = [[0] * 24 for _ in range(7)]
-    projs = {"today": {}, "7d": {}, "30d": {}}
+    projs = {"today": {}, "7d": {}, "30d": {}, "90d": {}, "180d": {}}
     sessions, daily_models, models_today = {}, {}, {}
 
     def proj_add(bucket, e, v):
@@ -1481,12 +2112,17 @@ def build_snapshot(entries, now, cfg, live, scan):
             if 0 <= i < 24:
                 hourly[i]["fam"][e.fam] += v
                 add(hourly[i]["agg"], e)
-        if 0 <= dd < 30:
-            b = daily[29 - dd]
+        if 0 <= dd < 180:
+            b = daily[179 - dd]
             b["fam"][e.fam] += v
             add(b["agg"], e)
-            heat[e.wday][e.hour] += v
-            heat_n[e.wday][e.hour] += 1
+            proj_add(projs["180d"], e, v)
+            if dd < hdays:
+                heat[e.wday][e.hour] += v
+                heat_n[e.wday][e.hour] += 1
+        if 0 <= dd < 90:
+            proj_add(projs["90d"], e, v)
+        if 0 <= dd < 30:
             add(k30, e)
             s30.add(e.session)
             proj_add(projs["30d"], e, v)
@@ -1509,6 +2145,7 @@ def build_snapshot(entries, now, cfg, live, scan):
     snap["hourly"], snap["daily"] = hourly, daily
     snap["heat"], snap["heat_n"] = heat, heat_n
     snap["heat_max"] = max(max(r) for r in heat)
+    snap["heat_days"] = hdays
     snap["models_today"] = ranked(models_today, metric)
     snap["projects"] = {}
     for rng_key, bucket in projs.items():
@@ -1540,6 +2177,7 @@ def build_snapshot(entries, now, cfg, live, scan):
         # only show Claude Code's figure when its snapshot is up to date with the log
         x["cc_cost"] = st[0] if st and x["agg"][4] <= st[1] * 1.03 + 0.01 else None
     snap["coverage"] = (logged / billed) if billed > 0 else None
+    snap["compare"] = {"cc": billed, "logs": logged} if billed > 0 else None
     snap["unpriced"] = dict(scan.get("unpriced") or {})
     shown = blocks[-6:][::-1]
     for b in shown:
@@ -1627,7 +2265,8 @@ def set_autostart(on):
         else:
             content = (f"[Desktop Entry]\nType=Application\nName={APP_NAME}\n"
                        f'Exec="{py}" "{script}"\nX-GNOME-Autostart-enabled=true\n')
-        with open(p, "w", encoding="utf-8") as fh:
+        enc = "utf-16" if IS_WIN else "utf-8"   # WScript reads a BOM-less .vbs as ANSI, mangling non-ASCII paths
+        with open(p, "w", encoding=enc) as fh:
             fh.write(content)
         return True
     except OSError:
@@ -1895,6 +2534,120 @@ def render_gfx(w, h, bg, shapes):
 
 
 # =============================================================================
+# App icon: a gauge ring drawn by the same pure-Python rasteriser, encoded as
+# PNG/ICO with nothing but the standard library. The window/taskbar icon is a
+# PhotoImage; the .ico lets a shortcut carry the same mark.
+# =============================================================================
+def g_arc(cx, cy, r, hw, a0, a1, color):
+    """Partial ring (a gauge arc) from angle a0 to a1 (radians, 0 = up, clockwise), round-capped."""
+    two_pi = 2 * math.pi
+
+    def fn(x, y):
+        dx, dy = x - cx, y - cy
+        d = math.hypot(dx, dy)
+        if abs(d - r) - hw > 1.0:
+            return 0.0
+        a = math.atan2(dx, -dy)
+        if a < 0:
+            a += two_pi
+        lo = a0 % two_pi
+        hi = lo + (a1 - a0)
+        if a < lo:
+            a += two_pi
+        if lo <= a <= hi:
+            return _acov(abs(d - r) - hw)
+        best = 0.0
+        for ang in (a0, a1):
+            ex, ey = cx + r * math.sin(ang), cy - r * math.cos(ang)
+            best = max(best, _acov(math.hypot(x - ex, y - ey) - hw))
+        return best
+    return (cx - r - hw - 1, cy - r - hw - 1, cx + r + hw + 1, cy + r + hw + 1), fn, color
+
+
+def icon_rgba(size, accent_hex, dark=True):
+    """RGBA bytes for the app icon: a rounded tile with a gauge ring, scaled to `size`."""
+    S = float(size)
+    cx = cy = S / 2.0
+    tile = (0x24, 0x24, 0x2c) if dark else (0xf3, 0xf3, 0xf6)
+    track = (0x55, 0x55, 0x60) if dark else (0xcd, 0xcd, 0xd5)
+    acc = _rgb(accent_hex)
+    R, hw = 0.30 * S, max(1.0, 0.085 * S)
+    mask = g_rrect(0.0, 0.0, S, S, 0.22 * S, (0, 0, 0))[1]
+    shapes = [g_ring(cx, cy, R, hw, track),
+              g_arc(cx, cy, R, hw, -math.pi / 2, -math.pi / 2 + 0.72 * 2 * math.pi, acc)]
+    prep = list(shapes)
+    out = bytearray()
+    for py in range(size):
+        y = py + 0.5
+        for pxi in range(size):
+            x = pxi + 0.5
+            c0, c1, c2 = tile
+            for (bx0, by0, bx1, by1), fn, col in prep:
+                if x < bx0 or x > bx1 or y < by0 or y > by1:
+                    continue
+                a = fn(x, y)
+                if a > 0.0:
+                    c0 += (col[0] - c0) * a
+                    c1 += (col[1] - c1) * a
+                    c2 += (col[2] - c2) * a
+            al = int(round(max(0.0, min(1.0, mask(x, y))) * 255))
+            out += bytes((int(c0 + 0.5) & 255, int(c1 + 0.5) & 255, int(c2 + 0.5) & 255, al))
+    return bytes(out)
+
+
+def png_bytes(w, h, rgba):
+    """Minimal PNG (8-bit RGBA) encoder using only zlib/struct."""
+    import struct
+    import zlib
+
+    def chunk(tag, data):
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    raw = bytearray()
+    stride = w * 4
+    for y in range(h):
+        raw.append(0)                              # filter type 0 (None)
+        raw += rgba[y * stride:(y + 1) * stride]
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+            + chunk(b"IEND", b""))
+
+
+def app_icon_bytes(size, accent_hex, dark=True):
+    return png_bytes(size, size, icon_rgba(size, accent_hex, dark))
+
+
+def ico_bytes(sizes, accent_hex, dark=True):
+    """Multi-resolution Windows .ico whose entries are PNGs (Vista+)."""
+    import struct
+    entries, blobs = b"", b""
+    offset = 6 + 16 * len(sizes)
+    for s in sizes:
+        png = app_icon_bytes(s, accent_hex, dark)
+        dim = 0 if s >= 256 else s                 # 0 means 256 in an ICO entry
+        entries += struct.pack("<BBBBHHII", dim, dim, 0, 0, 1, 32, len(png), offset)
+        blobs += png
+        offset += len(png)
+    return struct.pack("<HHH", 0, 1, len(sizes)) + entries + blobs
+
+
+def write_ico(path, accent_hex, dark=True, sizes=(16, 24, 32, 48, 64, 128, 256)):
+    with open(path, "wb") as fh:
+        fh.write(ico_bytes(sizes, accent_hex, dark))
+    return path
+
+
+def icon_photo(root, accent_hex, dark=True, size=64):
+    """A Tk PhotoImage of the app icon, or None when Tk/PNG support is missing."""
+    try:
+        return tk.PhotoImage(master=root, data=app_icon_bytes(size, accent_hex, dark))
+    except Exception:  # noqa: BLE001 - an icon must never break startup
+        return None
+
+
+# =============================================================================
 # Mascot "Tick": an original little gauge character that reacts to alerts
 # =============================================================================
 MASCOT_N = 12
@@ -1903,7 +2656,7 @@ MASCOT_N = 12
 def mascot_mood(ev):
     if ev["kind"] == "reset":
         return "joy"
-    if ev["kind"] == "forecast":
+    if ev["kind"] in ("forecast", "spend"):
         return "worried"
     p = ev["pct"]
     return "happy" if p < 50 else "calm" if p < 75 else "worried" if p < 90 else "alarmed" if p < 100 else "out"
@@ -1911,7 +2664,7 @@ def mascot_mood(ev):
 
 def mascot_caption(ev):
     m = mascot_mood(ev)
-    if ev["kind"] == "forecast":
+    if ev["kind"] in ("forecast", "spend"):
         return ev["text"]
     return {"happy": "Nice and easy. %d%% used." % ev["pct"], "calm": "Halfway there. %d%% used." % ev["pct"],
             "worried": "Heads up: %d%% used." % ev["pct"], "alarmed": "Almost out! %d%% used." % ev["pct"],
@@ -2338,6 +3091,117 @@ class Worker(threading.Thread):
             self.wake.clear()
 
 
+def tray_available():
+    """True when the optional tray dependencies are installed (pystray + Pillow)."""
+    try:
+        import pystray  # noqa: F401
+        from PIL import Image  # noqa: F401
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def tray_lines(s, fields):
+    """Text lines for the tray tooltip/menu: chosen fields from a snapshot; unknown ones are skipped."""
+    live = (s or {}).get("live") or {}
+    items = {i.get("key"): i for i in live.get("items") or []}
+    g = (s or {}).get("gauge") or {}
+    out = []
+    for fld in fields or ():
+        if fld == "window" and g.get("pct") is not None:
+            out.append(f"5-hour {fmt_pct(g['pct'])}")
+        elif fld == "week":
+            it = items.get("seven_day")
+            if it and isinstance(it.get("pct"), (int, float)):
+                out.append(f"Week {fmt_pct(it['pct'])}")
+        elif fld == "spend":
+            ex = live.get("extra") or {}
+            if isinstance(ex.get("used"), (int, float)):
+                cap = ex.get("limit")
+                out.append(f"Spend {ex['used']:,.0f}"
+                           + (f" / {cap:,.0f}" if isinstance(cap, (int, float)) else ""))
+    return out
+
+
+class TrayIcon:
+    """Optional system-tray icon. The pystray thread never touches tk directly - callbacks hop via root.after."""
+
+    def __init__(self, app):
+        self.app, self.icon, self._pt, self._last = app, None, None, 0.0
+
+    def start(self):
+        if self.icon is not None or not self.app.cfg.get("tray") or not tray_available():
+            return
+        try:
+            import pystray
+            self._pt = pystray
+            icon = pystray.Icon("limitline", self._image(None, STATUS["good"]), APP_NAME)
+            icon.menu = self._menu()
+            icon.run_detached()
+            self.icon = icon
+        except Exception:  # noqa: BLE001 - the tray is a convenience; never break the widget
+            self.icon = None
+            diag("tray", "could not start")
+
+    def stop(self):
+        icon, self.icon = self.icon, None
+        if icon is not None:
+            try:
+                icon.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def update(self, s):
+        icon = self.icon
+        if icon is None:
+            return
+        now = time.time()
+        if now - self._last < 20 and self._last:    # no per-second icon churn; first update always lands
+            return
+        self._last = now
+        lines = tray_lines(s, self.app.cfg.get("tray_fields"))
+        g = (s or {}).get("gauge") or {}
+        pct = g.get("pct") if isinstance(g.get("pct"), (int, float)) else None
+        col = STATUS["crit"] if (pct or 0) >= 90 else (STATUS["warn"] if (pct or 0) >= 75 else STATUS["good"])
+        try:
+            icon.title = APP_NAME + (" · " + " · ".join(lines) if lines else "")
+            icon.icon = self._image(pct if self.app.cfg.get("tray_style") != "dot" else None, col)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _menu(self):
+        pystray, app = self._pt, self.app
+
+        def toggle():
+            app.root.after(0, app.toggle_from_tray)
+
+        def quick():
+            cmd = app.cfg.get("quick_action_command")
+            if str(cmd or "").strip():
+                threading.Thread(target=run_hook_command, args=(cmd,), daemon=True).start()
+
+        items = [pystray.MenuItem("Show / Hide", toggle, default=True)]
+        if str(app.cfg.get("quick_action_command") or "").strip():
+            items.append(pystray.MenuItem("Run quick action", quick))
+        items.append(pystray.MenuItem("Quit", lambda: app.root.after(0, app.quit)))
+        return pystray.Menu(*items)
+
+    def _image(self, pct, color):
+        """A 64px gauge-ring icon (pct None = plain dot), drawn once per change."""
+        from PIL import Image, ImageDraw
+        size = 64
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        if pct is None:
+            d.ellipse([16, 16, 48, 48], fill=color)
+            return img
+        d.ellipse([4, 4, 60, 60], fill=(32, 32, 34, 255), outline=(90, 90, 96, 255), width=3)
+        frac = min(1.0, max(0.0, pct / 100.0))
+        if frac > 0.001:
+            d.arc([8, 8, 56, 56], -90, -90 + int(360 * frac), fill=color, width=7)
+        return img
+
+
 # =============================================================================
 # UI - application
 # =============================================================================
@@ -2360,9 +3224,16 @@ class App:
         self.live = DemoLive(args.demo) if args.demo else LiveLimits(self)
         self.tip = FloatTip(self)
         self.mascot = Mascot(self)
+        self.tray = TrayIcon(self)
         self.topmost_var = tk.BooleanVar(value=bool(cfg["topmost"]))
         root.title(APP_NAME)
         root.resizable(False, False)
+        self._icon = icon_photo(root, self.th["accent"], cfg["theme"] == "dark")
+        if self._icon is not None:
+            try:
+                root.iconphoto(True, self._icon)
+            except tk.TclError:
+                pass
         self.apply_window_attrs()
         self.build()
         self.bind_keys()
@@ -2370,6 +3241,11 @@ class App:
         self.worker = Worker(self)
         self.worker.start()
         threading.Thread(target=self.live.loop, daemon=True).start()
+        self.cli_installs = None   # [(label, version)]; probed once in the background, never blocks startup
+        threading.Thread(target=self._load_clis, daemon=True).start()
+        root.after(2000, self._run_start_hook)
+        if cfg.get("tray") and not getattr(args, "selftest", False):
+            root.after(1200, self.tray.start)   # deferred so startup never waits on the tray thread
         root.protocol("WM_DELETE_WINDOW", self.quit)
         root.after(120, self.poll)
         try:
@@ -2383,12 +3259,31 @@ class App:
             except OSError:
                 self._script_mtime = None
             threading.Thread(target=write_logcheck, daemon=True).start()
+        if IS_WIN and not args.demo:
+            threading.Thread(target=self._ensure_icon_file, daemon=True).start()
         if getattr(args, "open_settings", False):
             root.after(600, self.open_settings)
         elif getattr(args, "setup", False) or (not args.demo and not cfg.get("welcomed")):
             root.after(900, self.open_welcome)
+        if CONFIG_ERROR[0]:
+            msg, CONFIG_ERROR[0] = CONFIG_ERROR[0], None
+            root.after(1400, lambda m=msg: self.flash_toast(m, 8))
 
     # ---------------------------------------------------------------- basics
+    def _ensure_icon_file(self, force=False):
+        """Keep a limitline.ico next to the script so a shortcut can point at it."""
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "limitline.ico")
+            if not force:
+                try:
+                    if os.path.getmtime(path) >= (self._script_mtime or 0):
+                        return
+                except OSError:
+                    pass
+            write_ico(path, self.th["accent"], self.cfg["theme"] == "dark")
+        except Exception:  # noqa: BLE001 - a missing shortcut icon is never fatal
+            pass
+
     def px(self, n):
         return int(round(n * self.S))
 
@@ -2788,6 +3683,18 @@ class App:
             m.grab_release()
 
     # ---------------------------------------------------------------- data loop
+    def _load_clis(self):
+        try:
+            self.cli_installs = claude_installs()
+        except Exception:  # noqa: BLE001 - the version readout must never break startup
+            self.cli_installs = []
+        self.q.put(("clis",))
+
+    def _run_start_hook(self):
+        if self.cfg.get("on_start_command"):
+            live = getattr(self, "live", None)
+            self.run_hook("on_start_command", "start", APP_NAME, 0, live.get() if live else None)
+
     def poll(self):
         got = False
         try:
@@ -2800,6 +3707,8 @@ class App:
                     self.update_footer()
                 elif item[0] == "mascot":
                     self.mascot.show(*item[1:])
+                elif item[0] == "clis":
+                    got = True   # version probe finished; re-render (alerts are idempotent, no double-fire)
                 elif item[0] == "error":
                     self.error, self.progress = item[1], None
                     self.update_footer()
@@ -2808,6 +3717,12 @@ class App:
         if got:
             self.render()
             self.check_alerts(self.snap)
+            self.tray.update(self.snap)
+        if (self.snap or {}).get("compare"):   # alternate footer: updated line / Claude Code comparison
+            phase = int(time.time()) % 30 < 15
+            if phase != getattr(self, "_foot_phase", None):
+                self._foot_phase = phase
+                self.update_footer()
         self.root.after(250, self.poll)
 
     def render(self):
@@ -2864,7 +3779,7 @@ class App:
         elif self.badge.winfo_manager():
             self.badge.pack_forget()
         g = (s or {}).get("gauge") or {}
-        title = APP_NAME if g.get("pct") is None else f"{g['pct']:.0f}% · {APP_NAME}"
+        title = APP_NAME if g.get("pct") is None else f"{fmt_pct(g['pct'])} · {APP_NAME}"
         self.root.title(title)
 
     def update_footer(self):
@@ -2880,15 +3795,17 @@ class App:
         elif s and s.get("unpriced") and 8 <= int(time.time()) % 30 < 16:
             names = ", ".join(sorted(s["unpriced"])[:2])
             left = f"Price is a guess for {names} - set price_overrides"
-        elif s and s.get("coverage") and s["coverage"] < 0.97 and int(time.time()) % 30 < 8:
-            left = f"Logs match ~{s['coverage'] * 100:.0f}% of Claude Code's own cost record"
+        elif s and s.get("compare") and int(time.time()) % 30 < 15:
+            cp = s["compare"]
+            left = (f"Claude Code {fmt_exact_cost(cp['cc'])} · logs {fmt_exact_cost(cp['logs'])} · "
+                    f"{fmt_pct(cp['logs'] / cp['cc'] * 100)} match")
         elif s:
             sc = s["scan"]
             if sc.get("demo"):
                 left = f"Demo data · updated {fmt_clock(s['now'])}"
             else:
-                left = (f"Updated {fmt_clock(s['now'])} · {sc['entries']:,} msgs · {sc['files']:,} "
-                        f"file{'' if sc['files'] == 1 else 's'}")
+                left = (f"Local Claude Code logs · updated {fmt_clock(s['now'])} · {sc['entries']:,} msgs · "
+                        f"{sc['files']:,} file{'' if sc['files'] == 1 else 's'}")
         else:
             left = "Starting…"
         right = METRIC_NAME.get(self.cfg["metric"], "")
@@ -3061,8 +3978,8 @@ class App:
         w, g = s["window"], s["gauge"]
         src = {"live": "of your plan's 5-hour limit", "auto": "of your busiest past window",
                "custom": "of your custom limit"}.get(g["src"], "")
-        first = f"Outer ring: {g['pct']:.0f}% {src}" if g["pct"] is not None else "Outer ring: no limit known yet"
-        return f"{first}\nInner ring: {w['elapsed'] * 100:.0f}% of the window's time has passed"
+        first = f"Outer ring: {fmt_pct(g['pct'])} {src}" if g["pct"] is not None else "Outer ring: no limit known yet"
+        return f"{first}\nInner ring: {fmt_pct(w['elapsed'] * 100)} of the window's time has passed"
 
     def empty_card(self, title, detail=""):
         body, _ = self.card(self.content)
@@ -3106,7 +4023,7 @@ class App:
         pct = g["pct"] if w else None
         self.draw_ring(ring, size, (pct or 0) / 100.0, sev[1], w["elapsed"] if w else 0.0)
         if pct is not None:
-            ring.create_text(size / 2, size / 2 - px(5), text=f"{pct:.0f}%", font=f["hero"], fill=th["ink"])
+            ring.create_text(size / 2, size / 2 - px(5), text=fmt_pct(pct), font=f["hero"], fill=th["ink"])
             cap = {"live": "of plan", "auto": "of record", "custom": "of limit"}.get(g["src"], "")
             ring.create_text(size / 2, size / 2 + px(15), text=cap, font=f["tiny"], fill=th["muted"])
         else:
@@ -3130,9 +4047,9 @@ class App:
                 rows.append(("Pace", f"{a} · {b}" if metric == "cost" else f"{b} · {a}", False))
                 proj = fmt_metric(w["proj"], metric)
                 if g["proj_pct"] is not None and g["src"] == "live":
-                    proj = f"~{g['proj_pct']:.0f}% of plan"
+                    proj = f"~{fmt_pct(g['proj_pct'])} of plan"
                 elif g["proj_pct"] is not None:
-                    proj += f" · {g['proj_pct']:.0f}%"
+                    proj += f" · {fmt_pct(g['proj_pct'])}"
                 rows.append(("By reset", proj, (g["proj_pct"] or 0) >= 100))
             else:
                 last = w["last"]
@@ -3163,6 +4080,21 @@ class App:
                 self.lbl(grid, k, "tiny", "muted").grid(row=i, column=0, sticky="w", pady=px(1))
                 self.lbl(grid, v, "small").grid(row=i, column=1, sticky="w", padx=(px(8), 0))
 
+        if w:
+            wtip = (f"Window {fmt_clock(w['start'])}–{fmt_clock(w['end'])}\n"
+                    f"{fmt_exact_cost(w['agg'][4])} · {fmt_exact_tokens(tok(w['agg']))} tokens · "
+                    f"{w['agg'][5]:,} msgs\n"
+                    f"in {fmt_exact_tokens(w['agg'][0])} · out {fmt_exact_tokens(w['agg'][1])} · "
+                    f"cache write {fmt_exact_tokens(w['agg'][2])} · cache read {fmt_exact_tokens(w['agg'][3])}")
+            stack, skip = [body, head], {ring}
+            while stack:
+                ww = stack.pop()
+                if ww in skip:
+                    continue
+                ww.bind("<Enter>", lambda e, t=wtip: self.tip.show(t, e.x_root, e.y_root))
+                ww.bind("<Leave>", lambda e: self.tip.hide())
+                stack.extend(ww.winfo_children())
+
         models = w["models"] if w and w["models"] else s["models_today"]
         if models:
             tk.Frame(body, bg=th["border"], height=1).pack(fill="x", pady=(px(12), px(10)))
@@ -3184,6 +4116,11 @@ class App:
             return self.bucket_tip(f"{fmt_clock(b['start'])}–{fmt_clock(b['start'] + 3600)}", b, metric)
 
         BarChart(self, body, self.CW, px(84), s["hourly"], metric, hour_label, hour_tip, mark_last=True)
+        if not any(sum(b["fam"].values()) for b in s["hourly"]):
+            hint = "Nothing logged on this computer in the last 24 hours."
+            if s.get("last_ts"):
+                hint += " Last entry %s." % fmt_ago(s["now"] - s["last_ts"])
+            self.lbl(body, hint, "tiny", "muted", justify="left").pack(anchor="w", pady=(px(6), 0))
 
     def composition(self, parent, models, metric, scope):
         """One stacked bar of model share + labelled keys (identity never by colour alone)."""
@@ -3254,7 +4191,9 @@ class App:
                 top = tk.Frame(r, bg=th["surface"])
                 top.pack(fill="x")
                 self.lbl(top, it["label"], "small", "ink2").pack(side="left")
-                self.lbl(top, f"{it['pct']:.0f}%", "smallb").pack(side="right")
+                if it["key"] not in LIVE_LABELS:
+                    self.lbl(top, " NEW ", "tinyb", "ink2", bg=th["raised"]).pack(side="left", padx=(px(6), 0))
+                self.lbl(top, fmt_pct(it["pct"]), "smallb").pack(side="right")
                 if sev[0] != "ok":
                     self.shape(top, sev[3], sev[1], 8).pack(side="right", padx=(0, px(5)))
                 bot = tk.Frame(r, bg=th["surface"])
@@ -3265,23 +4204,35 @@ class App:
                            ticks=5 if period == WINDOW_SEC else 7).pack(side="left")
                 self.lbl(bot, reset_txt, "tiny", "muted").pack(side="right")
                 if it["resets"]:
-                    tip = f"{it['label']}: {it['pct']:.0f}% used, {elapsed * 100:.0f}% of the period gone\n" \
+                    tip = f"{it['label']}: {fmt_pct(it['pct'])} used, {fmt_pct(elapsed * 100)} of the period gone\n" \
                           f"Resets {fmt_when(it['resets'], s['now'])} (in {fmt_dur(it['resets'] - s['now'])})\n" \
                           "White line = time elapsed. Fill past the line = on track to run out early."
                     for w in (r, top, bot) + tuple(top.winfo_children()) + tuple(bot.winfo_children()):
                         w.bind("<Enter>", lambda e, t=tip: self.tip.show(t, e.x_root, e.y_root))
                         w.bind("<Leave>", lambda e: self.tip.hide())
-            if s["now"] - live.get("fetched", s["now"]) > 1800 and live.get("source") != "oauth":
-                self.lbl(body, "Refreshes whenever you use Claude Code in a terminal. Covers all your Claude use "
-                               "(web, desktop, other PCs).", "tiny", "muted", justify="left",
+            if st == "stale" and live.get("msg"):
+                self.lbl(body, live.get("msg"), "tiny", "muted", justify="left",
                          wraplength=self.CW).pack(anchor="w", pady=(px(8), 0))
+            if any(it["key"] not in LIVE_LABELS for it in rows):
+                self.lbl(body, "A limit type we don't recognise yet - check for an app update.", "tiny", "muted",
+                         justify="left", wraplength=self.CW).pack(anchor="w", pady=(px(8), 0))
+            cap = ("Anthropic's numbers for your whole account - all Claude use: web, desktop, cloud, other PCs."
+                   if live.get("source") == "oauth" else
+                   "Anthropic's numbers for your whole account - all Claude use (web, desktop, cloud, other PCs); "
+                   "they refresh while Claude Code runs here.")
+            self.lbl(body, cap, "tiny", "muted", justify="left", wraplength=self.CW).pack(anchor="w", pady=(px(8), 0))
             ex = live.get("extra")
             if ex:
                 r = tk.Frame(body, bg=th["surface"])
                 r.pack(fill="x", pady=(px(9), 0))
-                txt = f"{ex['pct']:.0f}% of monthly cap" if ex.get("pct") is not None else "on"
+                txt = f"{fmt_pct(ex['pct'])} of monthly cap" if ex.get("pct") is not None else "on"
                 self.lbl(r, "Extra usage", "small", "ink2").pack(side="left")
                 self.lbl(r, txt, "smallb").pack(side="right")
+            ptxt = prepaid_text(live.get("prepaid"))
+            if ptxt:
+                self.lbl(body, ptxt, "tiny", "muted").pack(anchor="w", pady=(px(6), 0))
+            if live.get("email"):
+                self.lbl(body, live["email"], "tiny", "muted").pack(anchor="w")
         elif st in ("ok", "stale"):
             return  # only the 5-hour limit exists and it's already the ring
         else:
@@ -3292,6 +4243,13 @@ class App:
                 self.lbl(body, "Showing estimates from your local logs instead.", "tiny", "muted").pack(anchor="w", pady=(px(2), 0))
             if st == "nobridge":
                 self.button(body, "Connect Claude Code", self.connect_statusline, primary=True).pack(anchor="w", pady=(px(10), 0))
+            clis = getattr(self, "cli_installs", None)
+            if clis:
+                self.lbl(body, " · ".join(f"{label} {ver}" for label, ver in clis), "tiny", "muted",
+                         justify="left", wraplength=self.CW).pack(anchor="w", pady=(px(8), 0))
+            elif clis is not None:
+                self.lbl(body, "No Claude Code install found on PATH. WSL installs aren't visible from Windows.",
+                         "tiny", "muted", justify="left", wraplength=self.CW).pack(anchor="w", pady=(px(8), 0))
 
     def render_kpis(self, s):
         th, px, metric = self.th, self.px, s["metric"]
@@ -3309,8 +4267,8 @@ class App:
             self.lbl(col, second, "tiny", "ink2").pack(anchor="w")
             self.lbl(col, f"{agg[5]:,} msgs", "tiny", "muted").pack(anchor="w")
             tip = f"{label}: {agg[5]:,} messages in {k[key]['sess']} session{'s' if k[key]['sess'] != 1 else ''}\n" \
-                  f"{fmt_cost(agg[4])} · in {fmt_tokens(agg[0])} · out {fmt_tokens(agg[1])} · " \
-                  f"cache write {fmt_tokens(agg[2])} · cache read {fmt_tokens(agg[3])}"
+                  f"{fmt_exact_cost(agg[4])} · in {fmt_exact_tokens(agg[0])} · out {fmt_exact_tokens(agg[1])} · " \
+                  f"cache write {fmt_exact_tokens(agg[2])} · cache read {fmt_exact_tokens(agg[3])}"
             for w in [col] + col.winfo_children():
                 w.bind("<Enter>", lambda e, t=tip: self.tip.show(t, e.x_root, e.y_root))
                 w.bind("<Leave>", lambda e: self.tip.hide())
@@ -3323,12 +4281,15 @@ class App:
                   f"({fmt_metric(avg, metric)}/day)"
             self.lbl(body, txt, "tiny", "ink2", wraplength=self.CW).grid(row=1, column=0, columnspan=5, sticky="w",
                                                                          pady=(px(8), 0))
+        self.lbl(body, "From Claude Code logs on this computer. Plan limits cover all your Claude use "
+                       "(web, desktop, cloud).", "tiny", "muted", wraplength=self.CW).grid(
+            row=2, column=0, columnspan=5, sticky="w", pady=(px(6), 0))
 
     def bucket_tip(self, title, b, metric):
         agg = b["agg"]
         if not agg[5]:
             return f"{title}\nNo usage"
-        lines = [title, f"{fmt_cost(agg[4])} · {fmt_tokens(tok(agg))} tokens · {agg[5]:,} msgs"]
+        lines = [title, f"{fmt_exact_cost(agg[4])} · {fmt_exact_tokens(tok(agg))} tokens · {agg[5]:,} msgs"]
         parts = sorted(((v, fm) for fm, v in b["fam"].items() if v > 0), reverse=True)
         if len(parts) > 1:
             lines.append(" · ".join(f"{FAM_LABEL[fm]} {fmt_metric(v, metric)}" for v, fm in parts[:3]))
@@ -3344,28 +4305,42 @@ class App:
         metric, n = s["metric"], self.cfg["hist_range"]
         top = tk.Frame(self.content, bg=th["bg"])
         top.pack(fill="x", pady=(0, px(8)))
-        self.segmented(top, [(7, "7 days"), (14, "14 days"), (30, "30 days")], n,
+        self.segmented(top, [(7, "7d"), (30, "30d"), (90, "90d"), (180, "180d")], n,
                        lambda k: self.set_cfg("hist_range", k)).pack(side="left")
         self.button(top, "Export CSV", self.export_csv).pack(side="right")
 
         days = s["daily"][-n:]
-        body, head = self.card(self.content, "Daily usage")
+        body, head = self.card(self.content, "Daily usage" if n < 90 else "Weekly usage")
         self.legend(head, [fm for fm in FAMS if any(b["fam"].get(fm) for b in days)])
+
+        chart, weekly = days, False
+        if n >= 90:
+            # long ranges read better as 7-day sums (each bar covers a week of the window)
+            chart = weekly_buckets(days)
+            weekly = True
 
         def day_lbl(i, b):
             d = date.fromordinal(b["day"])
-            if n == 7:
+            if weekly:
+                step = max(1, len(chart) // 6)
+                if (len(chart) - 1 - i) % step:
+                    return None
+                return f"{d.day} {MONTHS[d.month - 1]}"
+            if n <= 7:
                 return WEEKDAYS[d.weekday()]
-            step = 2 if n == 14 else 5
+            step = max(1, n // 6)
             if (len(days) - 1 - i) % step:
                 return None
             return f"{d.day} {MONTHS[d.month - 1]}" if i < step else str(d.day)
 
         def day_tip(i):
-            b = days[i]
+            b = chart[i]
+            if weekly:
+                rng = day_label(b["day"], s["today"]) + " – " + day_label(b["end"], s["today"])
+                return self.bucket_tip(rng, b, metric)
             return self.bucket_tip(day_label(b["day"], s["today"]), b, metric)
 
-        BarChart(self, body, self.CW, px(112), days, metric, day_lbl, day_tip, mark_last=True)
+        BarChart(self, body, self.CW, px(112), chart, metric, day_lbl, day_tip, mark_last=True)
         vals = [sum(b["fam"].values()) for b in days]
         total = sum(vals)
         if total > 0:
@@ -3390,7 +4365,7 @@ class App:
                                 fill=ramp(th["heat"], i / 4.0), width=0)
         lg.create_text(x0 + 5 * (cell + 1) + px(4), mid, text="more", anchor="w", font=tf, fill=th["muted"])
         Heatmap(self, body, self.CW, s)
-        self.lbl(body, "Last 30 days, by weekday and hour.", "tiny", "muted").pack(anchor="w", pady=(px(6), 0))
+        self.lbl(body, f"Last {s['heat_days']} days, by weekday and hour.", "tiny", "muted").pack(anchor="w", pady=(px(6), 0))
 
         blocks = s["blocks"]
         if blocks:
@@ -3415,7 +4390,8 @@ class App:
                 mrow.pack(fill="x", pady=(px(4), 0))
                 pct_txt = f"{frac * 100:.0f}%"
                 self.lbl(mrow, f"{b['agg'][5]:,} msgs · {pct_txt}", "tiny", "muted").pack(side="right")
-                self.meter(mrow, frac, sev[1] if s["limit"] else th["accent"], width=self.CW - px(96), height=5).pack(side="left")
+                self.meter(mrow, frac, sev[1] if s["limit"] else th["accent"], width=self.CW - px(96), height=5,
+                           ticks=5).pack(side="left")
 
     # ---------------------------------------------------------------- projects
     def render_projects(self, s):
@@ -3425,7 +4401,7 @@ class App:
         metric, rk = s["metric"], self.cfg["proj_range"]
         top = tk.Frame(self.content, bg=th["bg"])
         top.pack(fill="x", pady=(0, px(8)))
-        self.segmented(top, [("today", "Today"), ("7d", "7 days"), ("30d", "30 days")], rk,
+        self.segmented(top, [("today", "Today"), ("7d", "7d"), ("30d", "30d"), ("90d", "90d"), ("180d", "180d")], rk,
                        lambda k: self.set_cfg("proj_range", k)).pack(side="left")
         rows = s["projects"][rk]
         if not rows:
@@ -3470,7 +4446,7 @@ class App:
                 self.lbl(t, " LIVE ", "tinyb", th["accent"], bg=th["accent_soft"]).pack(side="left", padx=(0, px(6)))
             self.lbl(t, self.elide(x["project"], self.f["bodyb"], self.CW - px(150)), "bodyb").pack(side="left")
             self.lbl(t, fmt_metric(x["val"], metric), "smallb").pack(side="right")
-            if x.get("cc_cost") and metric == "cost" and x["cc_cost"] > x["val"] * 1.02:
+            if x.get("cc_cost") and metric == "cost":
                 self.lbl(t, f"CC {fmt_cost(x['cc_cost'])}", "tiny", "muted").pack(side="right", padx=(0, px(6)))
             b = tk.Frame(r, bg=th["surface"])
             b.pack(fill="x", pady=(px(3), 0))
@@ -3499,7 +4475,7 @@ class App:
         self.draw_ring(self.mini_ring, size, (pct or 0) / 100.0, sev[1], None, thick=px(5))
         if w:
             val = fmt_metric(w["val"], metric)
-            self.mini_top.configure(text=f"{pct:.0f}%  ·  {val}" if pct is not None else val)
+            self.mini_top.configure(text=f"{fmt_pct(pct)}  ·  {val}" if pct is not None else val)
             sub = f"limit ~{fmt_clock(g['eta'])}" if g["eta"] else f"resets in {fmt_dur(w['remaining'])}"
             self.mini_sub.configure(text=sub)
         else:
@@ -3539,9 +4515,15 @@ class App:
         cfg, now = self.cfg, s["now"]
         quiet = alerts_quiet(cfg, now)
         events = plan_alerts(cfg, s, cfg.setdefault("alerted", {}), now)
+        live = s.get("live") or {}
         for ev in events:
             self.raise_alert(ev, quiet)
-            self.run_hook("on_alert_command", ev["kind"], ev["label"], ev["pct"])
+            if not quiet:      # quiet hours / snooze: the banner is the only trace, hooks stay silent too
+                self.run_hook("on_alert_command", ev["kind"], ev["label"], ev["pct"], live)
+                if ev["kind"] == "forecast":
+                    self.run_hook("on_forecast_command", ev["kind"], ev["label"], ev["pct"], live)
+                else:
+                    self.run_hook("on_threshold_command", ev["kind"], ev["label"], ev["pct"], live)
         if events:
             self.save_soon()
         w, g = s["window"], s["gauge"]
@@ -3554,7 +4536,8 @@ class App:
             ev = {"kind": "reset", "scope": "session", "level": 0, "pct": 0, "label": "5-hour window",
                   "text": "Your 5-hour window has reset. Full capacity is back.", "title": "Window reset"}
             self.raise_alert(ev, quiet)
-            self.run_hook("on_reset_command", "reset", "5-hour window", 0)
+            if not quiet:
+                self.run_hook("on_reset_command", "reset", "5-hour window", 0, live)
         self.prev_win = {"key": key, "max": max(pct, pw["max"] if pw and pw["key"] == key else 0)}
 
     def snooze(self, minutes):
@@ -3565,13 +4548,21 @@ class App:
                       else "Alerts resumed", time.time() + 5)
         self.update_footer()
 
-    def run_hook(self, key, event, label, pct):
-        cmd = str(self.cfg.get(key) or "").strip()
+    def run_hook(self, key, event, label, pct, live=None):
+        cmd = self.cfg.get(key)
         if not cmd or self.args.demo:
             return
-        env = dict(os.environ, LIMITLINE_EVENT=event, LIMITLINE_LABEL=label, LIMITLINE_PCT=f"{pct:.0f}")
+        env = dict(os.environ, **hook_env(live, event, label, pct))
         try:
-            subprocess.Popen(cmd, shell=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if isinstance(cmd, (list, tuple)):
+                argv = [str(x) for x in cmd]
+                if argv:
+                    subprocess.Popen(argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                cmd = str(cmd).strip()
+                if cmd:
+                    subprocess.Popen(cmd, shell=True, env=env,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
             pass
 
@@ -3650,6 +4641,14 @@ class App:
         self.apply_window_attrs()
         if cfg["theme"] != old["theme"] or cfg["accent"] != old["accent"]:
             self._rings.clear()
+            self._icon = icon_photo(self.root, self.th["accent"], cfg["theme"] == "dark")
+            if self._icon is not None:
+                try:
+                    self.root.iconphoto(True, self._icon)
+                except tk.TclError:
+                    pass
+            if IS_WIN:
+                threading.Thread(target=self._ensure_icon_file, args=(True,), daemon=True).start()
             self.build()
             if IS_WIN:
                 self.root.after(60, self.win_tweaks)
@@ -3657,8 +4656,17 @@ class App:
             self.pin_btn.set_active(cfg["topmost"])
         if cfg["extra_paths"] != old["extra_paths"] or cfg["history_days"] != old["history_days"]:
             self.worker.reset = True
-        if cfg["live_limits"] != old["live_limits"] or cfg["live_oauth"] != old["live_oauth"]:
+        if (cfg["live_limits"] != old["live_limits"] or cfg["live_oauth"] != old["live_oauth"]
+                or cfg.get("live_refresh") != old.get("live_refresh")):
             self.live.wake.set()
+        if (cfg.get("tray") != old.get("tray") or cfg.get("tray_style") != old.get("tray_style")
+                or cfg.get("tray_fields") != old.get("tray_fields")
+                or bool(cfg.get("quick_action_command")) != bool(old.get("quick_action_command"))):
+            self.tray.stop()
+            if cfg.get("tray"):
+                self.tray.start()
+                self.tray._last = 0.0
+                self.tray.update(self.snap)
         self.worker.wake.set()
         self.save_soon()
         self.render()
@@ -3678,6 +4686,9 @@ class App:
                 self.apply_settings(old)
                 self.live.wake.set()
                 self.worker.wake.set()
+                if CONFIG_ERROR[0]:
+                    msg, CONFIG_ERROR[0] = CONFIG_ERROR[0], None
+                    self.flash_toast(msg, 8)
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -3708,12 +4719,23 @@ class App:
 
     def quit(self):
         try:
+            self.tray.stop()
             if not self.cfg["mini"] or self.cfg.get("x") is None:
                 self.cfg["x"], self.cfg["y"] = self.root.winfo_x(), self.root.winfo_y()
             if self.persist:
                 save_config(self.cfg)
         finally:
             self.root.destroy()
+
+    def toggle_from_tray(self):
+        try:
+            if self.root.winfo_ismapped():
+                self.root.withdraw()
+            else:
+                self.root.deiconify()
+                self.root.lift()
+        except tk.TclError:
+            pass
 
 
 # =============================================================================
@@ -3833,7 +4855,7 @@ class Heatmap:
         v, n = s["heat"][d][h], s["heat_n"][d][h]
         day = ["Mondays", "Tuesdays", "Wednesdays", "Thursdays", "Fridays", "Saturdays", "Sundays"][d]
         body = f"{fmt_metric(v, s['metric'])} · {n:,} msgs" if n else "No usage"
-        self.app.tip.show(f"{day} {h:02d}:00–{(h + 1) % 24:02d}:00\n{body} (last 30 days)", e.x_root, e.y_root)
+        self.app.tip.show(f"{day} {h:02d}:00–{(h + 1) % 24:02d}:00\n{body} (last {s['heat_days']} days)", e.x_root, e.y_root)
 
     def leave(self, _e=None):
         self.c.delete("hover")
@@ -3925,6 +4947,11 @@ class SettingsDialog:
             "qto": tk.StringVar(value=cfg["quiet_to"]),
             "extra": tk.StringVar(value=(cfg["extra_paths"] or [""])[0]),
             "hook": tk.StringVar(value=cfg.get("on_alert_command") or ""),
+            "hook_threshold": tk.StringVar(value=cfg.get("on_threshold_command") or ""),
+            "hook_forecast": tk.StringVar(value=cfg.get("on_forecast_command") or ""),
+            "hook_start": tk.StringVar(value=cfg.get("on_start_command") or ""),
+            "pace_bypass": tk.StringVar(value=str(cfg.get("alerts_pace_bypass") or "")),
+            "quick_action": tk.StringVar(value=cfg.get("quick_action_command") or ""),
             "opacity": tk.IntVar(value=int(round(cfg["opacity"] * 100))),
         }
         th = app.th
@@ -4081,6 +5108,18 @@ class SettingsDialog:
         self.row(box, "Always on top", self.switch("topmost"))
         self.row(box, "Borderless window", self.switch("frameless"), "Off = use the system title bar")
         self.row(box, "Launch at login", self.switch("_autostart"))
+        have_tray = tray_available()
+        self.row(box, "Tray icon", self.switch("tray"),
+                 "Needs the optional tray packages: pip install \"limitline[tray]\"" if not have_tray
+                 else "Gauge ring in the system tray; click the icon to show/hide the widget")
+
+        def quick(parent):
+            fr = tk.Frame(parent, bg=th["surface"])
+            self.entry("quick_action", 18)(fr).pack(side="left", ipady=px(2))
+            app.button(fr, "Test", lambda: self._test_hook("quick_action", "quick")).pack(side="left", padx=(px(6), 0))
+            return fr
+        self.row(box, "Tray quick action", quick,
+                 "Shell command from the tray menu; runs even when the widget is hidden")
 
         box = self.section(left, "Tracking")
         self.row(box, "Main measure", self.seg("metric", [("cost", "Cost"), ("tokens", "Tokens"), ("io", "In+out")]),
@@ -4104,7 +5143,7 @@ class SettingsDialog:
             tk.Label(fr, text="sec", font=f["small"], fg=th["muted"], bg=th["surface"]).pack(side="left", padx=(px(4), 0))
             return fr
         self.row(box, "Rescan logs every", refresh)
-        self.row(box, "History kept", self.seg("history_days", [(30, "30d"), (60, "60d"), (90, "90d")]))
+        self.row(box, "History kept", self.seg("history_days", [(30, "30d"), (90, "90d"), (180, "180d")]))
 
         box = self.section(right, "Alerts")
         self.row(box, "Usage alerts", self.switch("alerts"), "Banner + border flash")
@@ -4128,12 +5167,15 @@ class SettingsDialog:
         self.row(box, "Pace warning", self.switch("alert_forecast"), "Warn when you're on course to run out early")
         self.row(box, "Only when ahead of pace", self.switch("alerts_pace_only"),
                  "Skip alerts while usage is behind the clock")
+        self.row(box, "Bypass at", pct_entry("pace_bypass", "%"),
+                 "Levels at or above this still alert when behind pace (empty/0 = off)")
         self.row(box, "Mascot", self.seg("mascot", [("off", "Off"), ("subtle", "Subtle"), ("full", "Every alert")]),
                  "Subtle: only at 75%+, pace warnings and resets")
         self.row(box, "Animate mascot", self.switch("mascot_animate"), "Turns itself off if your OS reduces motion")
         self.row(box, "Desktop notifications", self.switch("desktop_notify"))
         self.row(box, "Alert sound", self.switch("alert_sound"))
-        self.row(box, "Quiet hours", self.switch("quiet_enabled"), "Banner only, no flash, sound, notification or mascot")
+        self.row(box, "Quiet hours", self.switch("quiet_enabled"),
+                 "Banner only - no flash, sound, notification, mascot or hook command")
 
         def quiet(parent):
             fr = tk.Frame(parent, bg=th["surface"])
@@ -4143,12 +5185,27 @@ class SettingsDialog:
             return fr
         self.row(box, "Quiet from", quiet, "24-hour times, e.g. 22:00 to 08:00")
         self.row(box, "Tell me when a window resets", self.switch("notify_reset"))
-        self.row(box, "Run on alert", self.entry("hook", 18),
-                 "Optional shell command (gets LIMITLINE_PCT / _LABEL / _EVENT)")
+
+        def hook_row(var, sample_event):
+            def make(parent):
+                fr = tk.Frame(parent, bg=th["surface"])
+                self.entry(var, 18)(fr).pack(side="left", ipady=px(2))
+                app.button(fr, "Test", lambda: self._test_hook(var, sample_event)).pack(side="left", padx=(px(6), 0))
+                return fr
+            return make
+        self.row(box, "Run on alert", hook_row("hook", "threshold"),
+                 "Shell command, argv list, or JSON list; gets LIMITLINE_* env; silent during quiet hours")
+        self.row(box, "Run on threshold", hook_row("hook_threshold", "threshold"),
+                 "Like 'Run on alert' but never for pace warnings")
+        self.row(box, "Run on forecast", hook_row("hook_forecast", "forecast"),
+                 "Only for pace warnings ('you'll run out early')")
+        self.row(box, "Run at startup", hook_row("hook_start", "start"),
+                 "Shell command run once when the app starts (same env vars; runs even in quiet hours)")
 
         box = self.section(right, "Live plan limits")
         live = app.live.get()
-        status = {"ok": "Connected" + (f" · {live['plan']} plan" if live.get("plan") else ""),
+        status = {"ok": "Connected" + (f" · {live['plan']} plan" if live.get("plan") else "")
+                           + (" · " + live["email"] if live.get("email") else ""),
                   "stale": "Connected (last update failed)", "off": "Off", "idle": "Checking…"}.get(
             live.get("status"), live.get("msg") or "Unavailable")
         self.row(box, "Show live limits", self.switch("live_limits"),
@@ -4162,8 +5219,12 @@ class SettingsDialog:
                  "Adds a status-line command to Claude Code's settings. Backed up and reversible.")
         self.row(box, "Use saved login instead", self.switch("live_oauth"),
                  "Advanced, off by default. Reads Claude Code's login token and asks Anthropic directly; adds "
-                 "per-model weekly limits. Anthropic's terms restrict third-party use of that token, so only "
+                 "per-model weekly limits, your account email and any prepaid balance (shown in memory only, "
+                 "never saved). Anthropic's terms restrict third-party use of that token, so only "
                  "enable it if you accept that risk.")
+        self.row(box, "Auto-refresh expired login", self.switch("live_refresh"),
+                 "With the saved login: when it has expired, run `claude update` once an hour so the CLI "
+                 "renews it. Still off unless you switch it on.")
 
         box = self.section(right, "Data")
         roots = log_roots(self.v.get("extra_paths") or [])
@@ -4205,6 +5266,12 @@ class SettingsDialog:
         self.vars["qfrom"].set(DEFAULTS["quiet_from"])
         self.vars["qto"].set(DEFAULTS["quiet_to"])
         self.vars["extra"].set("")
+        self.vars["hook"].set("")
+        self.vars["hook_threshold"].set("")
+        self.vars["hook_forecast"].set("")
+        self.vars["hook_start"].set("")
+        self.vars["pace_bypass"].set("")
+        self.vars["quick_action"].set("")
         self.vars["opacity"].set(int(DEFAULTS["opacity"] * 100))
         self.build()
         self.fit()
@@ -4227,6 +5294,12 @@ class SettingsDialog:
         if v["limit_mode"] == "custom" and v["limit_value"] <= 0:
             v["limit_mode"] = "auto"
         v["on_alert_command"] = self.vars["hook"].get().strip()
+        v["on_threshold_command"] = self.vars["hook_threshold"].get().strip()
+        v["on_forecast_command"] = self.vars["hook_forecast"].get().strip()
+        v["on_start_command"] = self.vars["hook_start"].get().strip()
+        v["quick_action_command"] = self.vars["quick_action"].get().strip()
+        pb = re.findall(r"\d+", self.vars["pace_bypass"].get())
+        v["alerts_pace_bypass"] = min(100, int(pb[0])) if pb and int(pb[0]) > 0 else 0
         extra = self.vars["extra"].get().strip()
         v["extra_paths"] = [extra] if extra else []
         old = dict(cfg)
@@ -4236,6 +5309,21 @@ class SettingsDialog:
         self.win.destroy()
         self.app.settings = None
         self.app.apply_settings(old)
+
+    def _test_hook(self, var, event):
+        """Run one hook command with a sample env and show the result; runs off the UI thread."""
+        cmd = self.vars[var].get().strip()
+        if not cmd:
+            self.app.flash_toast("Nothing to test - the command is empty")
+            return
+        app = self.app
+        env = dict(os.environ, **hook_env(None, event, "Test alert", 50))
+        app.flash_toast("Testing\u2026")
+        def go():
+            code, out = run_hook_command(cmd, env, timeout=10)
+            msg = f"exit {code}" + (f"\n{out}" if out else "")
+            app.root.after(0, lambda: app.flash_toast("Test: " + msg.replace("\n", " · ")[:200]))
+        threading.Thread(target=go, daemon=True).start()
 
     def cancel(self):
         try:
@@ -4369,11 +5457,61 @@ def run_selftest(args):
     saved_env = os.environ.get("CLAUDE_CONFIG_DIR")
     out(f"Limitline {VERSION} self-test")
     out(f"Python {sys.version.split()[0]} on {sys.platform} ({os.name}), exe: {sys.executable}")
+    out("Note: this check briefly opens and closes windows, shows the mascot and sends one test notification.")
 
     check("tkinter available", lambda: (tk is not None, f"Tk {tk.TkVersion}" if tk else "missing"))
     check("config save/load round-trip", lambda: (
         (lambda c0: (c0.update(opacity=0.8, alert_levels=[50, 95]), save_config(c0), load_config())[2])(load_config())
         .get("alert_levels") == [50, 95]))
+
+    def formatting():
+        bad = []
+        if fmt_pct(41) != "41%" or fmt_pct(41.27) != "41.3%" or fmt_pct(100.0) != "100%":
+            bad.append("fmt_pct")
+        if fmt_exact_cost(0.275273) != "$0.275273" or fmt_cost(-5) != "-$5.00" or fmt_cost(0.004) != "<$0.01":
+            bad.append("cost")
+        if fmt_tokens(999999) != "1.00M" or fmt_exact_tokens(1234567) != "1,234,567":
+            bad.append("tokens")
+        if fmt_axis(0, "cost") != "$0" or fmt_axis(0.003, "cost") != "$0.003":
+            bad.append("fmt_axis")
+        return not bad, ", ".join(bad) or "percent, exact dollars, tokens, axis"
+    check("formatting helpers", formatting)
+
+    def corrupt_config():
+        with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+            fh.write("{ not json at all")
+        CONFIG_ERROR[0] = None
+        cfg0 = load_config()
+        stashed = os.path.exists(CONFIG_PATH + ".bad") and not os.path.exists(CONFIG_PATH)
+        noticed = CONFIG_ERROR[0] is not None
+        CONFIG_ERROR[0] = None
+        for p in (CONFIG_PATH + ".bad", CONFIG_PATH):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        return cfg0["theme"] == DEFAULTS["theme"] and stashed and noticed, \
+               f"defaults={cfg0['theme']}, kept a .bad copy={stashed}, reported={noticed}"
+    check("unreadable settings are backed up, not overwritten", corrupt_config)
+
+    def shell_roundtrip():
+        cd = os.path.join(tmp, "a&b")                       # a metacharacter and no space
+        cmd = statusline_command('echo "x & y"', config_dir=cd)
+        back = _chain_of(cmd)
+        quoted = (not IS_WIN) or ('"' + cd + '"' in cmd)
+        return back == 'echo "x & y"' and quoted, f"config-dir quoted={quoted}, chain recovered={back!r}"
+    check("status-line shell quoting round-trips", shell_roundtrip)
+
+    def demo_week():
+        st = DemoLive("live").get()
+        n = time.time()
+        r7 = [i["resets"] for i in st["items"] if i["key"] == "seven_day"][0]
+        d = date.fromordinal(local_day(n))
+        exp = day_start(local_day(n) + ((0 - d.weekday()) % 7 or 7)) + 9 * 3600   # next Monday 09:00
+        when = datetime.fromtimestamp(r7)
+        return r7 == exp and r7 > n and when.weekday() == 0 and when.hour == 9, \
+               f"weekly reset {fmt_dur(r7 - n)} away ({when:%a %H:%M})"
+    check("demo weekly limit resets next Monday morning", demo_week)
 
     def logs():
         roots = log_roots([])
@@ -4587,16 +5725,35 @@ def main():
     ap.add_argument("--uninstall-statusline", action="store_true", help="undo --install-statusline")
     ap.add_argument("--tab", choices=["overview", "history", "projects", "sessions"], help=argparse.SUPPRESS)
     ap.add_argument("--open-settings", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--verbose", action="store_true",
+                    help="print redacted diagnostics to the console (never tokens or message text)")
+    ap.add_argument("--write-icon", metavar="PATH",
+                    help="write the app icon (a multi-size .ico) to PATH and exit")
     args = ap.parse_args()
-    global CONFIG_PATH, APP_NAME
+    global VERBOSE, CONFIG_PATH, APP_NAME
+    VERBOSE = bool(getattr(args, "verbose", False))
+    diag("start", APP_NAME, VERSION, "py", sys.version.split()[0], "platform", sys.platform)
     if args.config_dir:
         d = os.path.abspath(os.path.expanduser(args.config_dir))
         os.environ["CLAUDE_CONFIG_DIR"] = d
         CONFIG_PATH = os.path.join(d, ".limitline.json")
         APP_NAME = f"{APP_NAME} [{os.path.basename(d.rstrip(os.sep)) or d}]"
         args.multi = True
+    if args.write_icon:
+        cfg = load_config()
+        th = make_theme(cfg["theme"], cfg.get("accent"))
+        try:
+            write_ico(args.write_icon, th["accent"], cfg["theme"] == "dark")
+        except OSError as ex:
+            print(f"Couldn't write the icon: {ex}", file=sys.stderr)
+            sys.exit(1)
+        print(args.write_icon)
+        sys.exit(0)
     if args.statusline:
-        run_statusline(args.then)
+        try:
+            run_statusline(args.then)
+        except Exception:  # noqa: BLE001 - a status line must never take Claude Code down
+            pass
         return
     if args.autostart:
         ok = set_autostart(args.autostart == "on")

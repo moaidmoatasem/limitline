@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "limitline"
-version = "2.3.3"
+version = "2.8.0"
 description = "Floating desktop monitor for Claude Code usage and plan limits (unofficial)"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -16,6 +16,10 @@ classifiers = [
   "Environment :: X11 Applications",
   "Topic :: Utilities",
 ]
+
+[project.optional-dependencies]
+tray = ["pystray>=0.19", "Pillow>=9"]
+dev = ["pytest>=7.0", "pytest-xvfb>=0.2", "hypothesis>=6.0", "pytest-benchmark>=4.0"]
 
 [project.scripts]
 limitline = "limitline:main"
