@@ -82,7 +82,7 @@ except ImportError:  # pragma: no cover - reported in main()
 _Canvas = tk.Canvas if tk else object
 
 APP_NAME = "Limitline"
-VERSION = "2.3.1"
+VERSION = "2.3.2"
 IS_WIN = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
 HOME = os.path.expanduser("~")
@@ -336,6 +336,8 @@ def fmt_when(ts, now):
 
 
 def parse_ts(s):
+    if isinstance(s, (int, float)) and not isinstance(s, bool) and s > 1e9:
+        return s / 1000.0 if s > 1e12 else float(s)      # epoch seconds or milliseconds
     if not isinstance(s, str) or len(s) < 19:
         return None
     try:
@@ -527,6 +529,68 @@ def log_roots(extra=()):
 _TS = operator.attrgetter("ts")
 
 
+def logcheck_path():
+    return os.path.join(os.path.dirname(CONFIG_PATH), ".limitline-logcheck.json")
+
+
+def write_logcheck(max_files=8):
+    """Structure-only summary of Claude Code's logs (key names and counts, never message text), for troubleshooting."""
+    roots = log_roots()
+    files = []
+    for r in roots:
+        for dp, _d, fs in os.walk(r):
+            files += [os.path.join(dp, f) for f in fs if f.endswith(".jsonl")]
+    files.sort(key=lambda f: os.path.getmtime(f) if os.path.exists(f) else 0, reverse=True)
+    out = {"version": VERSION, "at": time.strftime("%Y-%m-%d %H:%M:%S"), "roots": roots, "jsonl_files": len(files),
+           "newest": [], "types": {}, "top_keys": {}, "msg_keys": {}, "usage_keys": {}, "ts_samples": [],
+           "lines": 0, "lines_with_usage": 0, "parsed_ok": 0}
+    probe = LogStore()
+    for f in files[:max_files]:
+        try:
+            st = os.stat(f)
+            out["newest"].append([st.st_size, time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))])
+            with open(f, "rb") as fh:
+                for n, raw in enumerate(fh):
+                    if n > 4000:
+                        break
+                    out["lines"] += 1
+                    try:
+                        d = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if not isinstance(d, dict):
+                        continue
+                    t = str(d.get("type"))
+                    out["types"][t] = out["types"].get(t, 0) + 1
+                    if b'"usage"' not in raw:
+                        continue
+                    out["lines_with_usage"] += 1
+                    k = ",".join(sorted(d.keys()))[:300]
+                    out["top_keys"][k] = out["top_keys"].get(k, 0) + 1
+                    m = d.get("message")
+                    if isinstance(m, dict):
+                        mk = ",".join(sorted(m.keys()))[:300]
+                        out["msg_keys"][mk] = out["msg_keys"].get(mk, 0) + 1
+                        if isinstance(m.get("usage"), dict):
+                            uk = ",".join(sorted(m["usage"].keys()))[:300]
+                            out["usage_keys"][uk] = out["usage_keys"].get(uk, 0) + 1
+                    if len(out["ts_samples"]) < 3:
+                        tsv = d.get("timestamp")
+                        out["ts_samples"].append(type(tsv).__name__ + ":" + str(tsv)[:32])
+                    before = len(probe.by_key)
+                    probe._parse(raw, f)
+                    out["parsed_ok"] += len(probe.by_key) > before
+        except OSError as ex:
+            out["newest"].append(["error", str(ex)[:120]])
+    for k in ("types", "top_keys", "msg_keys", "usage_keys"):
+        out[k] = dict(sorted(out[k].items(), key=lambda kv: -kv[1])[:8])
+    try:
+        _write_json_atomic(logcheck_path(), out)
+    except OSError:
+        pass
+    return out
+
+
 class LogStore:
     demo = False
 
@@ -594,7 +658,7 @@ class LogStore:
                     if not raw.endswith(b"\n"):
                         break  # incomplete line - pick it up next time
                     pos += len(raw)
-                    if b'"usage"' in raw and b'"assistant"' in raw:
+                    if b'"usage"' in raw:
                         self._parse(raw, path)
                     elif b'"cost-state"' in raw:
                         self._parse_cost_state(raw)
@@ -607,12 +671,12 @@ class LogStore:
             d = json.loads(raw)
         except ValueError:
             return
-        if not isinstance(d, dict) or d.get("type") != "assistant":
+        if not isinstance(d, dict):
             return
-        msg = d.get("message")
-        if not isinstance(msg, dict):
+        msg = d.get("message") if isinstance(d.get("message"), dict) else d
+        if d.get("type") not in ("assistant", None) and msg.get("role") != "assistant":
             return
-        u = msg.get("usage")
+        u = msg.get("usage") if isinstance(msg.get("usage"), dict) else d.get("usage")
         if not isinstance(u, dict):
             return
         model = str(msg.get("model") or "unknown")
@@ -622,7 +686,7 @@ class LogStore:
         cw, cr = _int(u.get("cache_creation_input_tokens")), _int(u.get("cache_read_input_tokens"))
         if not (inp or out or cw or cr):
             return
-        ts = parse_ts(d.get("timestamp"))
+        ts = parse_ts(d.get("timestamp") or msg.get("timestamp") or d.get("created_at"))
         if ts is None:
             return
         mid, rid = msg.get("id"), d.get("requestId")
@@ -835,6 +899,12 @@ def run_statusline(chain=None):
         out = " · ".join(bits)
     if sys.stdout:
         sys.stdout.write(out)
+    try:
+        lc = logcheck_path()
+        if not os.path.exists(lc) or time.time() - os.path.getmtime(lc) > 3600:
+            write_logcheck()
+    except Exception:  # noqa: BLE001 - never break Claude Code's status line
+        pass
 
 
 def _statusline_note(text):
@@ -2270,6 +2340,8 @@ class App:
         threading.Thread(target=self.live.loop, daemon=True).start()
         root.protocol("WM_DELETE_WINDOW", self.quit)
         root.after(120, self.poll)
+        if not args.demo:
+            threading.Thread(target=write_logcheck, daemon=True).start()
         if getattr(args, "open_settings", False):
             root.after(600, self.open_settings)
         elif getattr(args, "setup", False) or (not args.demo and not cfg.get("welcomed")):

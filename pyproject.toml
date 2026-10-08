@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "limitline"
-version = "2.3.1"
+version = "2.3.2"
 description = "Floating desktop monitor for Claude Code usage and plan limits (unofficial)"
 readme = "README.md"
 requires-python = ">=3.8"
