@@ -82,7 +82,7 @@ except ImportError:  # pragma: no cover - reported in main()
 _Canvas = tk.Canvas if tk else object
 
 APP_NAME = "Limitline"
-VERSION = "2.3.2"
+VERSION = "2.3.3"
 IS_WIN = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
 HOME = os.path.expanduser("~")
@@ -200,12 +200,16 @@ def load_config(reset=False):
     return cfg
 
 
+_CFG_SAVED_MTIME = [None]
+
+
 def save_config(cfg):
     try:
         tmp = CONFIG_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(cfg, fh, indent=2)
         os.replace(tmp, CONFIG_PATH)
+        _CFG_SAVED_MTIME[0] = os.path.getmtime(CONFIG_PATH)
     except OSError:
         pass
 
@@ -1121,6 +1125,11 @@ class LiveLimits:
     def fetch(self):
         """Official status-line data first; the saved login is used only if the user opted in."""
         b = read_bridge()
+        if self.app.cfg.get("live_oauth") and not (b and b[0] and time.time() - b[1] <= 900):
+            st = self.fetch_oauth()
+            if st["status"] == "ok" or not (b and b[0]):
+                st.setdefault("source", "oauth")
+                return st
         if b and b[0]:
             age = time.time() - b[1]
             st = {"status": "ok" if age <= 900 else "stale", "plan": None, "items": b[0], "extra": None,
@@ -2356,7 +2365,12 @@ class App:
         threading.Thread(target=self.live.loop, daemon=True).start()
         root.protocol("WM_DELETE_WINDOW", self.quit)
         root.after(120, self.poll)
+        try:
+            _CFG_SAVED_MTIME[0] = os.path.getmtime(CONFIG_PATH)
+        except OSError:
+            pass
         if not args.demo:
+            root.after(5000, self.watch_config)
             threading.Thread(target=write_logcheck, daemon=True).start()
         if getattr(args, "open_settings", False):
             root.after(600, self.open_settings)
@@ -3637,6 +3651,25 @@ class App:
         self.worker.wake.set()
         self.save_soon()
         self.render()
+
+    def watch_config(self):
+        """Pick up edits to the settings file made outside the app (installer, another tool, by hand)."""
+        try:
+            m = os.path.getmtime(CONFIG_PATH)
+            if _CFG_SAVED_MTIME[0] is not None and m != _CFG_SAVED_MTIME[0] and self.settings is None:
+                _CFG_SAVED_MTIME[0] = m
+                new = load_config()
+                old = dict(self.cfg)
+                for k in ("x", "y", "mini", "tab", "alerted"):
+                    new[k] = old.get(k)
+                self.cfg.clear()
+                self.cfg.update(new)
+                self.apply_settings(old)
+                self.live.wake.set()
+                self.worker.wake.set()
+        except Exception:  # noqa: BLE001
+            pass
+        self.root.after(5000, self.watch_config)
 
     def quit(self):
         try:
