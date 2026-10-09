@@ -1,6 +1,6 @@
 # Limitline installer for Windows (current user, no admin needed).
 #   Double-click install.bat   or   powershell -ExecutionPolicy Bypass -File scripts\install.ps1
-#   One-liner (after publishing):  irm https://raw.githubusercontent.com/<you>/limitline/main/scripts/install.ps1 | iex
+#   One-liner (after publishing):  irm https://raw.githubusercontent.com/moaidmoatasem/limitline/main/scripts/install.ps1 | iex
 # Options: -Uninstall  -NoAutostart  -NoLaunch  -Desktop
 param([switch]$Uninstall, [switch]$NoAutostart, [switch]$NoLaunch, [switch]$Desktop,
       [string]$Repo = "moaidmoatasem/limitline")

@@ -2,7 +2,7 @@
 # Limitline installer for macOS and Linux (current user, no sudo).
 #   ./scripts/install.sh            install, connect live limits, start at login, launch
 #   ./scripts/install.sh --uninstall
-#   curl -fsSL https://raw.githubusercontent.com/<you>/limitline/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/moaidmoatasem/limitline/main/scripts/install.sh | bash
 # Options: --no-autostart  --no-launch
 set -euo pipefail
 REPO="${LIMITLINE_REPO:-moaidmoatasem/limitline}"

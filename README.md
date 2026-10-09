@@ -29,7 +29,7 @@ One Python file. No dependencies beyond the standard library (tkinter) - the opt
 |---|---|
 | **Windows** | Download the repo, double-click **`install.bat`**. It installs Python 3.12 via winget if missing, adds a Start-menu shortcut, connects live limits, starts at login and launches. |
 | **macOS / Linux** | `./scripts/install.sh` (same steps; adds a `limitline` command). |
-| **Python already** | `pipx install git+https://github.com/<you>/limitline` (or `pip install`), then run `limitline`. |
+| **Python already** | `pipx install git+https://github.com/moaidmoatasem/limitline` (or `pip install`), then run `limitline`. |
 | **Just trying it** | `python limitline.py --demo` |
 
 First launch shows a three-step welcome window (history found, **Connect** live limits, start with your computer). Nothing needs editing by hand. Check everything with `limitline --selftest`. Remove it with `install.bat -Uninstall` or `./scripts/install.sh --uninstall`; that also restores your previous status line.
