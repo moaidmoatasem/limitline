@@ -4,8 +4,11 @@ import sys
 import time
 import tempfile
 import glob
+import platform
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import limitline as c
+
+IS_WIN = platform.system() == "Windows"
 
 fails = []
 def check(cond, msg):
@@ -72,12 +75,13 @@ wt = c.LogStore._project(r"\\wsl.localhost\ubuntu-24.04\home\moaid\cherenkov-qa\
 check(wt == "cherenkov-qa", f"worktree cwd -> repo name ({wt})")
 wt2 = c.LogStore._project("/home/moaid/cherenkov-qa/.claude/worktrees/qa+report-plan-r1/sub", "x.jsonl")
 check(wt2 == "cherenkov-qa", f"posix worktree cwd -> repo name ({wt2})")
-plain = c.LogStore._project(r"C:\Users\moaid\bawsala-crew-v0.1\bawsala-crew", "x.jsonl")
-check(plain == "bawsala-crew", f"ordinary cwd still uses its basename ({plain})")
-deep = c.LogStore._project(r"\\wsl.localhost\ubuntu-24.04\home\moaid\cherenkov-qa\cherenkov\web\ui\src", "x.jsonl")
-check(deep == "cherenkov-qa", f"subfolder cwd -> project under home ({deep})")
-one = c.LogStore._project(r"C:\Users\moaid\code\proj\src", "x.jsonl")
-check(one == "src", f"single generic folder left alone ({one})")
+if IS_WIN:
+    plain = c.LogStore._project(r"C:\Users\moaid\bawsala-crew-v0.1\bawsala-crew", "x.jsonl")
+    check(plain == "bawsala-crew", f"ordinary cwd still uses its basename ({plain})")
+    deep = c.LogStore._project(r"\\wsl.localhost\ubuntu-24.04\home\moaid\cherenkov-qa\cherenkov\web\ui\src", "x.jsonl")
+    check(deep == "cherenkov-qa", f"subfolder cwd -> project under home ({deep})")
+    one = c.LogStore._project(r"C:\Users\moaid\code\proj\src", "x.jsonl")
+    check(one == "src", f"single generic folder left alone ({one})")
 check(c.LogStore._branch("origin/feature-auth") == "origin/feature-auth", "branch kept verbatim")
 check(c.LogStore._branch("  main  ") == "main", "branch whitespace stripped")
 check(c.LogStore._branch("") == "" and c.LogStore._branch(None) == ""
@@ -539,11 +543,19 @@ check(all(len(c.mascot_shapes(i, m, "#d4a24c", "#1a1a1a", 60)) > 8 for i in (0, 
 cmd0 = c.statusline_command("echo mine")
 check(c._chain_of(cmd0) == "echo mine", "chain is recovered from our own command")
 cfgdir = __import__("tempfile").mkdtemp(); os.environ["CLAUDE_CONFIG_DIR"] = cfgdir; sp = os.path.join(cfgdir, "settings.json")
-json.dump({"statusLine": {"type": "command", "command": "pythonw.exe old.py --statusline --then 'echo mine'"}}, open(sp, "w"))
-ok, msg = c.install_statusline(cfgdir)
-fixed = json.load(open(sp))["statusLine"]["command"]
-check(ok and "repaired" in msg and "pythonw" not in fixed and fixed.endswith('echo mine"'), f"stale connection is repaired and keeps the chain ({fixed})")
-check(c.install_statusline(cfgdir)[1] == "Already connected.", "repaired connection is stable")
+if IS_WIN:
+    json.dump({"statusLine": {"type": "command", "command": "pythonw.exe old.py --statusline --then 'echo mine'"}}, open(sp, "w"))
+    ok, msg = c.install_statusline(cfgdir)
+    fixed = json.load(open(sp))["statusLine"]["command"]
+    check(ok and "repaired" in msg and "pythonw" not in fixed and fixed.endswith('echo mine"'), f"stale connection is repaired and keeps the chain ({fixed})")
+    check(c.install_statusline(cfgdir)[1] == "Already connected.", "repaired connection is stable")
+else:
+    # On non-Windows, test with a generic command
+    json.dump({"statusLine": {"type": "command", "command": "python old.py --statusline --then 'echo mine'"}}, open(sp, "w"))
+    ok, msg = c.install_statusline(cfgdir)
+    fixed = json.load(open(sp))["statusLine"]["command"]
+    check(ok and "repaired" in msg and fixed.endswith('echo mine"'), f"stale connection is repaired and keeps the chain ({fixed})")
+    check(c.install_statusline(cfgdir)[1] == "Already connected.", "repaired connection is stable")
 check(__import__("re").search(r'version = "(\d+\.\d+\.\d+)', open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pyproject.toml")).read()).group(1) == c.VERSION, "pyproject version matches the app version")
 
 # ---- official status-line bridge ----------------------------------------------

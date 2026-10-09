@@ -45,7 +45,7 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 5
         run: |
-          sudo apt-get update && sudo apt-get install -y python3-tk xvfb libgl1-mesa-glx
+          sudo apt-get update && sudo apt-get install -y python3-tk xvfb libgl1
           export DISPLAY=:99
           Xvfb :99 -screen 0 1024x768x24 &
           sleep 3
