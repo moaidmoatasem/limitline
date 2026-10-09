@@ -86,7 +86,7 @@ except ImportError:  # pragma: no cover - reported in main()
 _Canvas = tk.Canvas if tk else object
 
 APP_NAME = "Limitline"
-VERSION = "2.8.0"
+VERSION = "2.12.0"
 IS_WIN = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
 HOME = os.path.expanduser("~")
@@ -155,7 +155,9 @@ DEFAULTS = {
     "extra_paths": [],
     "price_overrides": {},
     "hist_range": 30,
-    "proj_range": "7d",
+    "hist_mode": "day",            # history chart shape: "day" (columns) or "cum" (running total)
+    "proj_range": "30d",
+    "scope": "both",            # overview data scope: "local" (Claude Code logs), "all" (account-wide) or "both"
     "alerted": {},
     "alerts_pace_only": False,  # only alert when usage is running ahead of the clock
     "alerts_pace_bypass": 0,    # with pace-only: levels >= this still alert when behind pace (0 = off)
@@ -215,8 +217,12 @@ def load_config(reset=False):
         cfg["metric"] = "cost"
     if cfg["hist_range"] not in (7, 30, 90, 180):
         cfg["hist_range"] = 30
+    if cfg["hist_mode"] not in ("day", "cum"):
+        cfg["hist_mode"] = "day"
     if cfg["proj_range"] not in ("today", "7d", "30d", "90d", "180d"):
-        cfg["proj_range"] = "7d"
+        cfg["proj_range"] = "30d"
+    if cfg["scope"] not in ("local", "all", "both"):
+        cfg["scope"] = "both"
     try:
         cfg["alert_levels"] = sorted({min(100, max(1, int(x))) for x in cfg["alert_levels"]})
     except (TypeError, ValueError):
@@ -608,14 +614,15 @@ def usage_cost(price, u):
 # =============================================================================
 class Entry:
     __slots__ = ("ts", "model", "fam", "disp", "inp", "out", "cw", "cr", "cost",
-                 "project", "session", "day", "hour", "wday")
+                 "project", "session", "branch", "day", "hour", "wday")
 
 
-def make_entry(ts, model, fam, disp, inp, out, cw, cr, cost, project, session):
+def make_entry(ts, model, fam, disp, inp, out, cw, cr, cost, project, session, branch=""):
     e = Entry()
     e.ts, e.model, e.fam, e.disp = ts, model, fam, disp
     e.inp, e.out, e.cw, e.cr, e.cost = inp, out, cw, cr, cost
     e.project, e.session = project, session
+    e.branch = branch
     lt = time.localtime(ts)
     e.day = date(lt.tm_year, lt.tm_mon, lt.tm_mday).toordinal()
     e.hour, e.wday = lt.tm_hour, lt.tm_wday
@@ -903,7 +910,8 @@ class LogStore:
         c = d.get("costUSD")
         cost = float(c) if isinstance(c, (int, float)) and not isinstance(c, bool) else usage_cost(price, u)
         e = make_entry(ts, sys.intern(model), fam, disp, inp, out, cw, cr, cost,
-                       self._project(d.get("cwd"), path), sys.intern(str(d.get("sessionId") or "?")))
+                       self._project(d.get("cwd"), path), sys.intern(str(d.get("sessionId") or "?")),
+                       self._branch(d.get("gitBranch")))
         old = self.by_key.get(key)
         if old is None or out >= old.out:   # same message logged per content block - keep one
             self.by_key[key] = e
@@ -922,6 +930,24 @@ class LogStore:
                 # with what the log held *at that point* (the line is read in file order).
                 logged = sum(e.cost for e in self.by_key.values() if e.session == sid)
                 self.cost_states[sid] = (float(c), logged)
+
+    @staticmethod
+    def _branch(raw):
+        """Session's git branch from the log line (top-level `gitBranch`), or ''.
+
+        Never touches the working tree: the value is whatever Claude Code logged.
+        Capped at 80 chars and interned; unusable values become ''."""
+        if not isinstance(raw, str):
+            return ""
+        b = raw.strip()
+        if not b:
+            return ""
+        if len(b) > 80:
+            b = b[:80]
+        try:
+            return sys.intern(b)
+        except (TypeError, ValueError):
+            return b
 
     @staticmethod
     def _project(cwd, path):
@@ -981,18 +1007,20 @@ class DemoStore(LogStore):
                 return m
         return self.MODELS[0][0]
 
-    def _add(self, ts, model, project, sid, inp, out, cw, cr):
+    def _add(self, ts, model, project, sid, inp, out, cw, cr, branch=""):
         fam, disp, price = self.meta(model)
         u = {"input_tokens": inp, "output_tokens": out, "cache_creation_input_tokens": cw,
              "cache_read_input_tokens": cr, "cache_creation": {"ephemeral_1h_input_tokens": cw}}
         self._n += 1
         self.by_key[("demo", self._n)] = make_entry(ts, model, fam, disp, inp, out, cw, cr,
-                                                    usage_cost(price, u), project, sid)
+                                                    usage_cost(price, u), project, sid, branch)
 
-    def _session(self, start, minutes, model=None, project=None):
+    def _session(self, start, minutes, model=None, project=None, branch=None):
         rng = self.rng
         model = model or self._pick_model()
         project = project or rng.choice(self.PROJECTS)
+        branch = branch if branch is not None else rng.choice(
+            ["main", "main", "main", "feature-auth", "release/v1.4", "semantic-search"])
         sid = "demo-%08x" % rng.getrandbits(32)
         t, end, ctx = start, start + minutes * 60, rng.randint(18000, 42000)
         while t < end and t < self.now0:
@@ -1003,7 +1031,7 @@ class DemoStore(LogStore):
                 ctx = rng.randint(25000, 45000)
                 cw = ctx
             m = model if rng.random() > 0.07 else "claude-haiku-4-5"
-            self._add(t, m, project, sid, rng.randint(2, 60), out, cw, ctx)
+            self._add(t, m, project, sid, rng.randint(2, 60), out, cw, ctx, branch)
             t += rng.uniform(14, 100)
         return sid
 
@@ -1023,9 +1051,15 @@ class DemoStore(LogStore):
         now = time.time()
         if now - self._tick > 15:  # keep the demo "alive"
             self._tick = self.now0 = now
+            live_branch = ""
+            for e in self.by_key.values():
+                if e.session == self._live_sid and getattr(e, "branch", ""):
+                    live_branch = e.branch
+                    break
             for k in range(self.rng.randint(1, 3)):
                 self._add(now - k * 4, "claude-sonnet-5-5", "data-pipeline", self._live_sid,
-                          4, self.rng.randint(150, 1600), 0, self.rng.randint(90000, 160000))
+                          4, self.rng.randint(150, 1600), 0, self.rng.randint(90000, 160000),
+                          live_branch)
         return 0, 0
 
 
@@ -1993,12 +2027,197 @@ def ranked(groups, metric):
     return rows
 
 
+# =============================================================================
+# Run groups, anomalies, waterfall, filtering (pure; Live Sessions view)
+#
+# Everything here derives from the session dicts built by build_snapshot -
+# no new data sources, no estimates dressed as measurements. Per-leg dollars
+# are deliberately NOT computed: one session mixes models, so splitting its
+# total across legs would invent precision. The waterfall is token legs plus
+# the real total; cache-hit rate is exact token math.
+# =============================================================================
+def session_branch(counts, last):
+    """Session's branch from per-message counts: most frequent wins, ties -> last seen."""
+    if not counts:
+        return ""
+    return max(counts.items(), key=lambda kv: (kv[1], kv[0] == last))[0]
+
+
+def build_run_groups(sessions, metric):
+    """Group enriched session dicts by (project, branch), richest group first.
+
+    Each group: project, branch, runs (newest first), val (metric sum),
+    tokens, msgs, first/last, live (count of live runs), models (sorted
+    display names), share (of total val, 0..1)."""
+    groups = {}
+    for x in sessions:
+        key = (x.get("project") or "unknown", x.get("branch") or "")
+        g = groups.get(key)
+        if g is None:
+            g = groups[key] = {"project": key[0], "branch": key[1], "runs": [],
+                               "val": 0.0, "tokens": 0, "msgs": 0,
+                               "first": x["first"], "last": x["last"],
+                               "live": 0, "models": set()}
+        g["runs"].append(x)
+        g["val"] += x["val"]
+        g["tokens"] += tok(x["agg"])
+        g["msgs"] += x["agg"][5]
+        g["first"] = min(g["first"], x["first"])
+        g["last"] = max(g["last"], x["last"])
+        g["live"] += 1 if x.get("live") else 0
+        g["models"].add(x.get("model") or "?")
+    total = sum(g["val"] for g in groups.values())
+    for g in groups.values():
+        g["runs"].sort(key=lambda r: -r["last"])
+        g["models"] = sorted(g["models"])
+        g["share"] = (g["val"] / total) if total > 0 else 0.0
+    return sorted(groups.values(), key=lambda g: -g["val"])
+
+
+ANOMALY_SHARE = 0.5    # a group holding half or more of the total is a concentration
+ANOMALY_MIN_COST = 25.0  # ... and any single group over $25 (cost metric) is worth a look
+
+
+def detect_anomalies(groups, metric="cost"):
+    """Flag spend-concentration groups. Pure; returns [{project, branch, share, reason}].
+
+    Wording is deliberately cautious ("concentration", never a root cause):
+    the logs show volume, not why it happened."""
+    out = []
+    for g in groups:
+        reasons = []
+        if g["share"] >= ANOMALY_SHARE and g["val"] > 0:
+            reasons.append("holds %s of the total" % fmt_pct(g["share"] * 100))
+        if metric == "cost" and g["val"] >= ANOMALY_MIN_COST:
+            reasons.append("exceeds %s" % fmt_cost(ANOMALY_MIN_COST))
+        if reasons:
+            out.append({"project": g["project"], "branch": g["branch"],
+                        "share": g["share"], "reason": " and ".join(reasons)})
+    return out
+
+
+def session_waterfall(agg):
+    """-> [(label, tokens)] for the four token legs, largest first."""
+    legs = [("Output", agg[1]), ("Cache read", agg[3]),
+            ("Cache write", agg[2]), ("Input", agg[0])]
+    legs.sort(key=lambda kv: -kv[1])
+    return legs
+
+
+def cache_hit_rate(agg):
+    """Fraction of input-side tokens served from cache, or None when there were none."""
+    denom = agg[0] + agg[2] + agg[3]
+    return (agg[3] / denom) if denom > 0 else None
+
+
+def run_state(x):
+    return "running" if x.get("live") else "completed"
+
+
+def filter_runs(groups, query="", state="all", fam="all"):
+    """Filter grouped runs. Pure; keeps group shape, drops empty groups.
+
+    query matches project, branch, session id or model (case-insensitive
+    substring). state is all | running | completed. fam is a model family
+    (opus/sonnet/haiku/fable/other) or all. There is no 'throttled' state:
+    the logs carry no per-session rate-limit signal, and inventing one
+    would be mock data."""
+    q = (query or "").strip().lower()
+    out = []
+    for g in groups:
+        runs = [r for r in g["runs"]
+                if (state == "all" or run_state(r) == state)
+                and (fam == "all" or r.get("fam") == fam)
+                and (not q or q in " ".join((g["project"], g["branch"],
+                                            str(r.get("id") or ""),
+                                            str(r.get("model") or ""))).lower())]
+        if runs:
+            cp = dict(g, runs=runs)
+            out.append(cp)
+    return out
+
+
+HEADROOM_OK = 70.0    # below this: room for anything; above: think before a big run
+HEADROOM_TIGHT = 90.0  # above this: the window is nearly spoken for
+
+
+def window_headroom(pct):
+    """Pacing advice for the current 5-hour window. Pure; -> (key, text).
+
+    Advice only — it never names a model as forbidden, it reads the real
+    percentage and says how much room that leaves."""
+    if pct is None:
+        return ("idle", "No active window — your next message starts one.")
+    if pct >= 100:
+        return ("crit", "No headroom left — wrap up or switch to lighter work.")
+    if pct >= HEADROOM_TIGHT:
+        return ("crit", "Tight — hold off on heavy reasoning runs until the reset.")
+    if pct >= HEADROOM_OK:
+        return ("warn", "Moderate — fine for Sonnet, a big Opus run may tip it.")
+    return ("ok", "Headroom for heavy models.")
+
+
+def weekly_emergency(live):
+    """Highest-pct weekly limit at or above 90%, or None. Pure.
+
+    Only `seven_day*` keys count (per-model weeklies included); the 5-hour
+    window has its own alerts and never triggers this card."""
+    if not isinstance(live, dict) or live.get("status") not in ("ok", "stale"):
+        return None
+    best = None
+    for it in live.get("items") or []:
+        if not it.get("key", "").startswith("seven_day"):
+            continue
+        if it.get("pct") is None or it["pct"] < 90:
+            continue
+        if best is None or it["pct"] > best["pct"]:
+            best = it
+    return best
+
+
+def day_velocity(hourly):
+    """24-hour pace stats from the hourly buckets. Pure.
+
+    -> {peak_tokens, peak_start, msgs, avg_tok_per_msg, hit}; averages are
+    None when there is nothing to average, never dressed-up zeros."""
+    peak_tokens, peak_start, msgs = 0, None, 0
+    inp = out = cw = cr = 0
+    for b in hourly:
+        t = tok(b["agg"])
+        if t > peak_tokens:
+            peak_tokens, peak_start = t, b["start"]
+        msgs += b["agg"][5]
+        inp += b["agg"][0]
+        out += b["agg"][1]
+        cw += b["agg"][2]
+        cr += b["agg"][3]
+    total = inp + out + cw + cr
+    denom = inp + cw + cr
+    return {"peak_tokens": peak_tokens, "peak_start": peak_start, "msgs": msgs,
+            "avg_tok_per_msg": (total / msgs) if msgs else None,
+            "hit": (cr / denom) if denom > 0 else None}
+
+
+HIST_RANGE_OPTS = [(7, 7), (30, 30), (90, 90), (180, 180)]
+PROJ_RANGE_OPTS = [("today", 1), ("7d", 7), ("30d", 30), ("90d", 90), ("180d", 180)]
+SESS_RUN_CAP = 30  # runs shown per expanded group; the rest are counted, not hidden silently
+
+
+def range_to_cover(days_ago, options):
+    """Value of the smallest option that still reaches back past `days_ago` days."""
+    for value, days in options:
+        if days_ago < days:
+            return value
+    return options[-1][0]
+
+
 def build_snapshot(entries, now, cfg, live, scan):
     metric = cfg.get("metric", "cost")
     today = local_day(now)
     live = live or {}
     snap = {"now": now, "metric": metric, "today": today, "scan": scan, "live": live,
-            "has_data": bool(entries), "last_ts": entries[-1].ts if entries else None}
+            "has_data": bool(entries), "last_ts": entries[-1].ts if entries else None,
+            "last_day": local_day(entries[-1].ts) if entries else None}
 
     # ---- 5-hour windows, same rule Claude Code uses: start at the hour of the first message
     blocks, cur = [], None
@@ -2090,11 +2309,15 @@ def build_snapshot(entries, now, cfg, live, scan):
     def proj_add(bucket, e, v):
         p = bucket.get(e.project)
         if p is None:
-            p = bucket[e.project] = {"name": e.project, "agg": new_agg(), "val": 0.0, "sess": set(), "last": 0.0}
+            p = bucket[e.project] = {"name": e.project, "agg": new_agg(), "val": 0.0, "sess": set(),
+                                     "last": 0.0, "branches": {}}
         add(p["agg"], e)
         p["val"] += v
         p["sess"].add(e.session)
         p["last"] = max(p["last"], e.ts)
+        b = getattr(e, "branch", "") or ""
+        if b:
+            p["branches"][b] = p["branches"].get(b, 0) + 1
 
     for e in entries:
         v = eval_entry(e, metric)
@@ -2103,10 +2326,15 @@ def build_snapshot(entries, now, cfg, live, scan):
         s = sessions.get(e.session)
         if s is None:
             s = sessions[e.session] = {"id": e.session, "project": e.project, "first": e.ts, "last": e.ts,
-                                       "agg": new_agg(), "models": defaultdict(float)}
+                                       "agg": new_agg(), "models": defaultdict(float),
+                                       "branches": {}, "last_branch": ""}
         s["last"] = e.ts
         add(s["agg"], e)
         s["models"][(e.fam, e.disp)] += v
+        b = getattr(e, "branch", "") or ""
+        if b:
+            s["branches"][b] = s["branches"].get(b, 0) + 1
+            s["last_branch"] = b
         if e.ts >= hour0:
             i = int((e.ts - hour0) // 3600)
             if 0 <= i < 24:
@@ -2152,17 +2380,22 @@ def build_snapshot(entries, now, cfg, live, scan):
         rows = []
         for p in bucket.values():
             p["sess"] = len(p["sess"])
+            counts = p.pop("branches", {})
+            p["branch"] = session_branch(counts, "")
+            p["n_branches"] = len(counts)
             rows.append(p)
         rows.sort(key=lambda r: -r["val"])
         snap["projects"][rng_key] = rows
-    sess = sorted(sessions.values(), key=lambda x: -x["last"])[:15]
-    for x in sess:
+    enriched = sorted(sessions.values(), key=lambda x: -x["last"])
+    for x in enriched:
         x["val"] = mval(x["agg"], metric)
         top = max(x["models"].items(), key=lambda kv: kv[1]) if x["models"] else (("other", "?"), 0)
         x["fam"], x["model"] = top[0]
         x["live"] = now - x["last"] < 15 * 60
         x["n_models"] = len(x["models"])
+        x["branch"] = session_branch(x.pop("branches", {}), x.pop("last_branch", ""))
         del x["models"]
+    sess = enriched[:15]
     snap["sessions"] = sess
     snap["n_sessions"] = len(sessions)
     # how much of Claude Code's own billed total the logs capture (logs miss some input/background calls)
@@ -2172,10 +2405,13 @@ def build_snapshot(entries, now, cfg, live, scan):
         if sid in cs and cs[sid][0] > 0:
             billed += cs[sid][0]
             logged += cs[sid][1]
-    for x in sess:
+    for x in enriched:
         st = cs.get(x["id"])
         # only show Claude Code's figure when its snapshot is up to date with the log
         x["cc_cost"] = st[0] if st and x["agg"][4] <= st[1] * 1.03 + 0.01 else None
+    snap["groups"] = build_run_groups(enriched, metric)
+    snap["anomalies"] = {(a["project"], a["branch"]): a
+                         for a in detect_anomalies(snap["groups"], metric)}
     snap["coverage"] = (logged / billed) if billed > 0 else None
     snap["compare"] = {"cc": billed, "logs": logged} if billed > 0 else None
     snap["unpriced"] = dict(scan.get("unpriced") or {})
@@ -3219,6 +3455,8 @@ class App:
         self.q = queue.Queue()
         self.snap = self.progress = self.error = self.toast = self.banner = self.prev_win = None
         self._rings, self._save_job, self._frameless, self._drag = {}, None, None, None
+        self._sess_query, self._sess_state, self._sess_fam = "", "all", "all"
+        self._sess_expanded, self._sess_selected, self._sess_entry = {}, None, None
         self.settings = None
         self.store = self.make_store()
         self.live = DemoLive(args.demo) if args.demo else LiveLimits(self)
@@ -3738,8 +3976,13 @@ class App:
             top = self.holder.yview()[0] if same else 0.0
             for w in self.content.winfo_children():
                 w.destroy()
-            getattr(self, "render_" + self.cfg["tab"], self.render_overview)(s)
-            self._rendered_tab = self.cfg["tab"]
+            tab = self.cfg["tab"]
+            if self.cfg.get("scope") == "all" and tab != "overview":
+                # scope 'Claude (all)' = account numbers only; the log tabs are local by nature
+                self.render_scope_hidden(s)
+            else:
+                getattr(self, "render_" + tab, self.render_overview)(s)
+            self._rendered_tab = tab
             self.render_banner()
             self.update_footer()
             self.fit_content(top)
@@ -4002,33 +4245,234 @@ class App:
             return True
         return False
 
+    def local_note(self, s):
+        """Source + freshness line for the log-derived tabs (History/Projects/Sessions)."""
+        if s is None or not s.get("last_ts"):
+            return "Local Claude Code logs"
+        return "Local Claude Code logs · last activity " + fmt_ago(s["now"] - s["last_ts"])
+
+    def empty_range_hint(self, s, current, key, options, label_of, title="No activity in this range"):
+        """Empty-state card for a chart range: say what exists and offer to widen to it."""
+        th, px = self.th, self.px
+        body, _ = self.card(self.content, title)
+        if not s.get("last_day"):
+            self.lbl(body, "Nothing found in your Claude Code logs.", "small", "ink2",
+                     justify="left", wraplength=self.CW).pack(anchor="w")
+            return
+        when = day_label(s["last_day"], s["today"])
+        self.lbl(body, f"Newest local activity: {when} ({fmt_ago(s['now'] - s['last_ts'])}).",
+                 "small", "ink2", justify="left", wraplength=self.CW).pack(anchor="w")
+        tgt = range_to_cover(s["today"] - s["last_day"], options)
+        if tgt is not None and tgt != current:
+            row = tk.Frame(body, bg=th["surface"])
+            row.pack(anchor="w", pady=(px(10), 0))
+            self.lbl(row, "Widen to see it:", "small", "muted").pack(side="left", padx=(0, px(8)))
+            self.button(row, f"Show {label_of(tgt)}", lambda: self.set_cfg(key, tgt)).pack(side="left")
+        else:
+            self.lbl(body, f"That's older than the widest range ({label_of(options[-1][0])}). "
+                           "Enable saved login in Settings, or add log folders, to bring in older activity.",
+                     "small", "muted", justify="left", wraplength=self.CW).pack(anchor="w", pady=(px(6), 0))
+
+# ---------------------------------------------------------- scope gating
+    def render_scope_hidden(self, s):
+        """Scope 'Claude (all)': the log tabs only hold local data, so say so and offer the switch."""
+        th, px = self.th, self.px
+        body, _ = self.card(self.content, "Hidden in this scope")
+        self.lbl(body, "This tab shows this PC's Claude Code logs. Your Overview scope is "
+                       "'Claude (all)' - account-wide plan numbers only, which carry no per-day, "
+                       "per-project or per-session detail.",
+                 "small", "ink2", justify="left", wraplength=self.CW).pack(anchor="w")
+        row = tk.Frame(body, bg=th["surface"])
+        row.pack(anchor="w", pady=(px(12), 0))
+        self.button(row, "Show Claude Code", lambda: self.set_cfg("scope", "local")).pack(side="left",
+                                                                                          padx=(0, px(8)))
+        self.button(row, "Show Both", lambda: self.set_cfg("scope", "both")).pack(side="left")
+
     # ---------------------------------------------------------------- overview
     def render_overview(self, s):
-        th, f, px = self.th, self.f, self.px
-        if s is None or (not s["has_data"] and not s["window"]):
+        th, px = self.th, self.px
+        scope = self.cfg.get("scope", "both")
+        top = tk.Frame(self.content, bg=th["bg"])
+        top.pack(fill="x", pady=(0, px(8)))
+        self.segmented(top, [("local", "Claude Code"), ("all", "Claude (all)"), ("both", "Both")], scope,
+                       lambda k: self.set_cfg("scope", k)).pack(side="left")
+        if s is None:
             self.no_data(s)
-            if s is not None:
+            return
+        if scope == "all":
+            self.render_weekly_emergency(s)
+            self.render_ring_card(s, force_live=True, show_models=False, live_only=True)
+            self.render_limits_card(s)
+            self.lbl(self.content,
+                     "Account-wide numbers come from Anthropic and carry no per-day or per-project detail; "
+                     "that only exists in Claude Code's local logs. Switch to 'Claude Code' or 'Both' for the charts.",
+                     "tiny", "muted", justify="left", wraplength=self.CW).pack(anchor="w", pady=(0, px(2)))
+            return
+        if not s["has_data"] and not s["window"]:
+            self.no_data(s)
+            if scope == "both":
                 self.render_limits_card(s)
             return
+        metric = s["metric"]
+        self.render_weekly_emergency(s)
+        self.render_ring_card(s, force_live=scope == "both")
+        if scope == "both":
+            self.render_limits_card(s)
+        self.render_kpis(s)
+
+        body, head = self.card(self.content, "Last 24 hours")
+        fams = [fm for fm in FAMS if any(b["fam"].get(fm) for b in s["hourly"])]
+        self.legend(head, fams)
+
+        def hour_label(i, b):
+            hr = time.localtime(b["start"]).tm_hour
+            return f"{hr:02d}" if hr % 6 == 0 and i < 23 else None
+
+        def hour_tip(i):
+            b = s["hourly"][i]
+            return self.bucket_tip(f"{fmt_clock(b['start'])}–{fmt_clock(b['start'] + 3600)}", b, metric)
+
+        BarChart(self, body, self.CW, px(84), s["hourly"], metric, hour_label, hour_tip,
+                 mark_last=True, peak=True)
+        if not any(sum(b["fam"].values()) for b in s["hourly"]):
+            hint = "Nothing logged on this computer in the last 24 hours."
+            if s.get("last_ts"):
+                hint += " Last entry %s." % fmt_ago(s["now"] - s["last_ts"])
+            self.lbl(body, hint, "tiny", "muted", justify="left").pack(anchor="w", pady=(px(6), 0))
+        else:
+            self.lbl(body, self.velocity_line(s), "tiny", "ink2", justify="left",
+                     wraplength=self.CW).pack(anchor="w", pady=(px(6), 0))
+        self.render_overview_runs(s)
+
+    def render_weekly_emergency(self, s):
+        """Persistent critical card when a weekly cap sits at/above 90%. -> shown?"""
+        hit = weekly_emergency(s.get("live"))
+        if hit is None:
+            return False
+        th, px = self.th, self.px
+        body, _ = self.card(self.content, "Weekly cap critical")
+        row = tk.Frame(body, bg=th["surface"])
+        row.pack(fill="x")
+        self.shape(row, "square", STATUS["crit"], 9).pack(side="left", padx=(0, px(6)))
+        when = ("resets %s" % fmt_when(hit["resets"], s["now"])) if hit.get("resets") \
+            else "no reset time known"
+        self.lbl(row, "%s is at %s — %s." % (hit.get("label") or "Weekly limit",
+                                             fmt_pct(hit["pct"]), when),
+                 "small", "ink2", justify="left",
+                 wraplength=self.CW - px(20)).pack(side="left")
+        brow = tk.Frame(body, bg=th["surface"])
+        brow.pack(anchor="w", pady=(px(10), 0))
+        self.button(brow, "Review thresholds", self.open_settings).pack(side="left", padx=(0, px(8)))
+        self.button(brow, "Snooze 1h", lambda: self.snooze(60)).pack(side="left")
+        return True
+
+    @staticmethod
+    def velocity_line(s):
+        """One honest pace sentence for the 24-hour chart."""
+        vel = day_velocity(s["hourly"])
+        bits = ["peak %s tok/h%s" % (fmt_tokens(vel["peak_tokens"]),
+                                     (" at %s" % fmt_clock(vel["peak_start"]))
+                                     if vel["peak_start"] else "")]
+        if vel["avg_tok_per_msg"] is not None:
+            bits.append("avg %s tok/msg" % fmt_tokens(vel["avg_tok_per_msg"]))
+        bits.append("cache hit %s" % (fmt_pct(vel["hit"] * 100)
+                                      if vel["hit"] is not None else "—"))
+        return " · ".join(bits)
+
+    def render_overview_runs(self, s):
+        """Runs happening now plus the newest runs, with a cross-link to Live Sessions."""
+        th, px, metric = self.th, self.px, s["metric"]
+        groups = s.get("groups") or []
+        live = [r for g in groups for r in g["runs"] if r.get("live")]
+        live.sort(key=lambda r: -r["last"])
+        if live:
+            body, _ = self.card(self.content, "Live right now", "%d active" % len(live))
+            for x in live[:3]:
+                self.overview_run_row(body, s, x)
+            if len(live) > 3:
+                self.lbl(body, "+ %d more live" % (len(live) - 3),
+                         "tiny", "muted").pack(anchor="w", pady=(px(6), 0))
+        all_runs = [r for g in groups for r in g["runs"]]
+        all_runs.sort(key=lambda r: -r["last"])
+        if not all_runs:
+            return
+        body, _ = self.card(self.content, "Recent runs")
+        for x in all_runs[:5]:
+            self.overview_run_row(body, s, x)
+        row = tk.Frame(body, bg=th["surface"])
+        row.pack(anchor="w", pady=(px(10), 0))
+        self.button(row, "Open Live Sessions", self.goto_live_sessions).pack(side="left")
+
+    def overview_run_row(self, parent, s, x):
+        th, px, metric = self.th, self.px, s["metric"]
+        r = tk.Frame(parent, bg=th["surface"])
+        r.pack(fill="x", pady=(px(3), 0))
+        t = tk.Frame(r, bg=th["surface"])
+        t.pack(fill="x")
+        if x["live"]:
+            self.lbl(t, " LIVE ", "tinyb", th["accent"], bg=th["accent_soft"]).pack(side="left",
+                                                                                   padx=(0, px(6)))
+        name = x["project"] + (" · " + x["branch"] if x.get("branch") else "")
+        self.lbl(t, self.elide(name, self.f["smallb"], self.CW - px(150)), "smallb").pack(side="left")
+        self.lbl(t, fmt_metric(x["val"], metric), "small").pack(side="right")
+        when = day_label(local_day(x["first"]), s["today"])
+        when = fmt_clock(x["first"]) if when == "Today" else "%s %s" % (when, fmt_clock(x["first"]))
+        self.lbl(r, self.elide("%s · %s · %s" % (x["model"], when, fmt_ago(s["now"] - x["last"])),
+                               self.f["tiny"], self.CW),
+                 "tiny", "muted").pack(anchor="w")
+
+    def goto_live_sessions(self):
+        self._sess_state = "all"
+        self.set_tab("sessions")
+
+    def render_ring_card(self, s, force_live=True, show_models=True, live_only=False):
+        """The 'Current 5-hour window' ring + stats card.
+
+        force_live=True uses the account-wide figures when the status-line / saved-login
+        feed is present (scope 'both' and 'Claude (all)'); force_live=False (scope
+        'Claude Code') renders the ring, chip and pace rows purely from local logs
+        versus the local limit - never the live gauge. live_only=True (scope
+        'Claude (all)') refuses the local fallback: without live data the ring shows
+        "no plan data" instead of a local estimate under an Anthropic caption.
+        """
+        th, f, px = self.th, self.f, self.px
         metric, w, g = s["metric"], s["window"], s["gauge"]
-        sev = severity(g["pct"] if w else None, th)
+        no_plan = False
+        if force_live:
+            live_src = g["src"] == "live"
+            no_plan = bool(live_only and not live_src)
+            pct = g["pct"] if (w and not no_plan) else None
+            src_txt = {"live": "of plan", "auto": "of record", "custom": "of limit"}.get(g["src"], "")
+            dg = g
+        else:
+            pct = (w["val"] / s["limit"] * 100) if (w and s["limit"]) else None
+            src_txt = {"auto": "of record", "custom": "of limit"}.get(s["limit_src"], "")
+            # display gauge: local pct only, no live eta/projection - the chip and rows
+            # below must agree with the ring, not with the hidden account figures.
+            dg = {"pct": pct, "src": s["limit_src"], "eta": None, "proj_pct": None}
+        sev = severity(pct, th)
 
         body, head = self.card(self.content, "Current 5-hour window")
-        self.chip(head, outlook(g, w, th))
+        if no_plan:
+            self.chip(head, ("idle", th["muted"], "No plan data", "ring"))
+        else:
+            self.chip(head, outlook(dg, w, th))
         row = tk.Frame(body, bg=th["surface"])
         row.pack(fill="x")
         size = px(116)
         ring = tk.Canvas(row, width=size, height=size, bg=th["surface"], highlightthickness=0, bd=0)
         ring.pack(side="left", anchor="n")
-        pct = g["pct"] if w else None
         self.draw_ring(ring, size, (pct or 0) / 100.0, sev[1], w["elapsed"] if w else 0.0)
         if pct is not None:
             ring.create_text(size / 2, size / 2 - px(5), text=fmt_pct(pct), font=f["hero"], fill=th["ink"])
-            cap = {"live": "of plan", "auto": "of record", "custom": "of limit"}.get(g["src"], "")
-            ring.create_text(size / 2, size / 2 + px(15), text=cap, font=f["tiny"], fill=th["muted"])
+            ring.create_text(size / 2, size / 2 + px(15), text=src_txt, font=f["tiny"], fill=th["muted"])
         else:
             ring.create_text(size / 2, size / 2 - px(5), text="—", font=f["hero"], fill=th["muted"])
-            ring.create_text(size / 2, size / 2 + px(15), text="idle" if not w else "no limit yet",
+            if no_plan:
+                cap = "no plan data"
+            else:
+                cap = "idle" if not w else "no limit yet"
+            ring.create_text(size / 2, size / 2 + px(15), text=cap,
                              font=f["tiny"], fill=th["muted"])
         ring.bind("<Enter>", lambda e: self.tip.show(self.ring_tip(), e.x_root, e.y_root))
         ring.bind("<Leave>", lambda e: self.tip.hide())
@@ -4046,16 +4490,17 @@ class App:
                 a, b = f"{fmt_cost(w['rate_cost_h'])}/h", f"{fmt_tokens(w['rate_tokens'])} tok/min"
                 rows.append(("Pace", f"{a} · {b}" if metric == "cost" else f"{b} · {a}", False))
                 proj = fmt_metric(w["proj"], metric)
-                if g["proj_pct"] is not None and g["src"] == "live":
-                    proj = f"~{fmt_pct(g['proj_pct'])} of plan"
-                elif g["proj_pct"] is not None:
-                    proj += f" · {fmt_pct(g['proj_pct'])}"
-                rows.append(("By reset", proj, (g["proj_pct"] or 0) >= 100))
+                if force_live and not no_plan:
+                    if g["proj_pct"] is not None and g["src"] == "live":
+                        proj = f"~{fmt_pct(g['proj_pct'])} of plan"
+                    elif g["proj_pct"] is not None:
+                        proj += f" · {fmt_pct(g['proj_pct'])}"
+                rows.append(("By reset", proj, force_live and (g["proj_pct"] or 0) >= 100))
             else:
                 last = w["last"]
                 rows.append(("Pace", "idle " + fmt_ago(s["now"] - last).replace(" ago", "") if last else "no activity yet",
                              False))
-            if g["eta"]:
+            if force_live and g["eta"]:
                 rows.append(("Limit", f"~{fmt_clock(g['eta'])} at this pace", True))
             for i, (k, v, warn) in enumerate(rows):
                 self.lbl(grid, k, "tiny", "muted", anchor="w").grid(row=i, column=0, sticky="w", pady=px(1))
@@ -4067,9 +4512,11 @@ class App:
         else:
             self.lbl(st, "Idle", "h1").pack(anchor="w")
             live_items = [it for it in (s["live"].get("items") or []) if s["live"].get("status") in ("ok", "stale")]
-            idle_msg = ("No Claude Code use on this PC in the last 5 hours. Use on claude.ai, the desktop app or "
-                        "other computers only shows in the live limits below." if live_items
-                        else "Your next message starts a fresh 5-hour window.")
+            if force_live and live_items:
+                idle_msg = ("No Claude Code use on this PC in the last 5 hours. Use on claude.ai, the desktop app or "
+                            "other computers only shows in the live limits below.")
+            else:
+                idle_msg = "Your next message starts a fresh 5-hour window."
             self.lbl(st, idle_msg, "small", "ink2", justify="left",
                      wraplength=self.CW - size - px(16)).pack(anchor="w", pady=(0, px(8)))
             grid = tk.Frame(st, bg=th["surface"])
@@ -4093,34 +4540,26 @@ class App:
                     continue
                 ww.bind("<Enter>", lambda e, t=wtip: self.tip.show(t, e.x_root, e.y_root))
                 ww.bind("<Leave>", lambda e: self.tip.hide())
-                stack.extend(ww.winfo_children())
 
-        models = w["models"] if w and w["models"] else s["models_today"]
-        if models:
-            tk.Frame(body, bg=th["border"], height=1).pack(fill="x", pady=(px(12), px(10)))
-            self.composition(body, models, metric, "This window" if w and w["models"] else "Today")
+        if show_models:
+            models = w["models"] if w and w["models"] else s["models_today"]
+            if models:
+                tk.Frame(body, bg=th["border"], height=1).pack(fill="x", pady=(px(12), px(10)))
+                self.composition(body, models, metric, "This window" if w and w["models"] else "Today")
 
-        self.render_limits_card(s)
-        self.render_kpis(s)
-
-        body, head = self.card(self.content, "Last 24 hours")
-        fams = [fm for fm in FAMS if any(b["fam"].get(fm) for b in s["hourly"])]
-        self.legend(head, fams)
-
-        def hour_label(i, b):
-            hr = time.localtime(b["start"]).tm_hour
-            return f"{hr:02d}" if hr % 6 == 0 and i < 23 else None
-
-        def hour_tip(i):
-            b = s["hourly"][i]
-            return self.bucket_tip(f"{fmt_clock(b['start'])}–{fmt_clock(b['start'] + 3600)}", b, metric)
-
-        BarChart(self, body, self.CW, px(84), s["hourly"], metric, hour_label, hour_tip, mark_last=True)
-        if not any(sum(b["fam"].values()) for b in s["hourly"]):
-            hint = "Nothing logged on this computer in the last 24 hours."
-            if s.get("last_ts"):
-                hint += " Last entry %s." % fmt_ago(s["now"] - s["last_ts"])
-            self.lbl(body, hint, "tiny", "muted", justify="left").pack(anchor="w", pady=(px(6), 0))
+        if no_plan:
+            hk, htext = "idle", "No plan data — connect the status line to gauge headroom."
+        else:
+            hk, htext = window_headroom(pct)
+        hrow = tk.Frame(body, bg=th["surface"])
+        hrow.pack(fill="x", pady=(px(10), 0))
+        hshape = {"ok": "dot", "warn": "triangle", "crit": "square", "idle": "ring"}[hk]
+        hcolor = {"ok": th["accent"], "warn": STATUS["warn"],
+                  "crit": STATUS["crit"], "idle": th["muted"]}[hk]
+        self.shape(hrow, hshape, hcolor, 8).pack(side="left", padx=(0, px(6)))
+        self.lbl(hrow, "Headroom", "tiny", "muted").pack(side="left", padx=(0, px(6)))
+        self.lbl(hrow, htext, "small", "ink2", justify="left",
+                 wraplength=self.CW - px(120)).pack(side="left")
 
     def composition(self, parent, models, metric, scope):
         """One stacked bar of model share + labelled keys (identity never by colour alone)."""
@@ -4221,6 +4660,12 @@ class App:
                    "Anthropic's numbers for your whole account - all Claude use (web, desktop, cloud, other PCs); "
                    "they refresh while Claude Code runs here.")
             self.lbl(body, cap, "tiny", "muted", justify="left", wraplength=self.CW).pack(anchor="w", pady=(px(8), 0))
+            k = s.get("kpi")
+            if (k and not mval(k["today"]["agg"], s["metric"]) > 0 and not mval(k["7d"]["agg"], s["metric"]) > 0
+                    and any((it.get("pct") or 0) >= 10 for it in rows)):
+                self.lbl(body, "Your plan shows usage, but none of it is on this PC's Claude Code logs - "
+                               "the History and Projects tabs only cover this computer.",
+                         "tiny", STATUS["warn"], justify="left", wraplength=self.CW).pack(anchor="w", pady=(px(8), 0))
             ex = live.get("extra")
             if ex:
                 r = tk.Frame(body, bg=th["surface"])
@@ -4303,21 +4748,32 @@ class App:
         if self.no_data(s):
             return
         metric, n = s["metric"], self.cfg["hist_range"]
+        mode = self.cfg.get("hist_mode", "day")
         top = tk.Frame(self.content, bg=th["bg"])
         top.pack(fill="x", pady=(0, px(8)))
         self.segmented(top, [(7, "7d"), (30, "30d"), (90, "90d"), (180, "180d")], n,
                        lambda k: self.set_cfg("hist_range", k)).pack(side="left")
         self.button(top, "Export CSV", self.export_csv).pack(side="right")
+        row = tk.Frame(self.content, bg=th["bg"])
+        row.pack(fill="x", pady=(0, px(8)))
+        self.segmented(row, [("day", "Per day"), ("cum", "Cumulative")], mode,
+                       lambda k: self.set_cfg("hist_mode", k)).pack(side="left")
+        if mode == "cum":
+            # own line, not the toolbar: segmented + full hint overflow the card width
+            self.lbl(self.content, "Cumulative rises only on days with use, so flat stretches are gaps.",
+                     "tiny", "muted", justify="left", wraplength=self.CW).pack(anchor="w", pady=(0, px(8)))
+        self.lbl(self.content, self.local_note(s), "tiny", "muted").pack(anchor="w", pady=(0, px(8)))
 
         days = s["daily"][-n:]
-        body, head = self.card(self.content, "Daily usage" if n < 90 else "Weekly usage")
+        if not any(sum(b["fam"].values()) for b in days):
+            self.empty_range_hint(s, n, "hist_range", HIST_RANGE_OPTS,
+                                  lambda v: f"{v}d", "No activity in this range")
+            return
+        weekly = n >= 90 and mode == "day"
+        chart = weekly_buckets(days) if weekly else days
+        body, head = self.card(self.content, "Cumulative usage" if mode == "cum"
+                               else ("Weekly usage" if weekly else "Daily usage"))
         self.legend(head, [fm for fm in FAMS if any(b["fam"].get(fm) for b in days)])
-
-        chart, weekly = days, False
-        if n >= 90:
-            # long ranges read better as 7-day sums (each bar covers a week of the window)
-            chart = weekly_buckets(days)
-            weekly = True
 
         def day_lbl(i, b):
             d = date.fromordinal(b["day"])
@@ -4340,7 +4796,20 @@ class App:
                 return self.bucket_tip(rng, b, metric)
             return self.bucket_tip(day_label(b["day"], s["today"]), b, metric)
 
-        BarChart(self, body, self.CW, px(112), chart, metric, day_lbl, day_tip, mark_last=True)
+        if mode == "cum":
+            CumulativeChart(self, body, self.CW, px(150), chart, metric, day_lbl, day_tip)
+        else:
+            avg_window = 0 if weekly or n <= 7 else 7
+            BarChart(self, body, self.CW, px(150), chart, metric, day_lbl, day_tip,
+                     mark_last=True, peak=True, values=not weekly and n <= 30, avg_window=avg_window)
+            if avg_window:
+                # key sits in the toolbar, not the card header: four or five model
+                # families plus a chip would overflow the header and clip the legend.
+                ln = tk.Frame(row, bg=th["bg"])
+                ln.pack(side="left", padx=(px(10), 0))
+                tk.Canvas(ln, width=px(14), height=max(1, px(2)), bg=mix(th["accent"], th["ink"], 0.25),
+                          highlightthickness=0).pack(side="left", padx=(0, px(4)))
+                self.lbl(ln, "7-day avg", "tiny", "muted").pack(side="left")
         vals = [sum(b["fam"].values()) for b in days]
         total = sum(vals)
         if total > 0:
@@ -4403,9 +4872,11 @@ class App:
         top.pack(fill="x", pady=(0, px(8)))
         self.segmented(top, [("today", "Today"), ("7d", "7d"), ("30d", "30d"), ("90d", "90d"), ("180d", "180d")], rk,
                        lambda k: self.set_cfg("proj_range", k)).pack(side="left")
+        self.lbl(self.content, self.local_note(s), "tiny", "muted").pack(anchor="w", pady=(0, px(8)))
         rows = s["projects"][rk]
         if not rows:
-            self.empty_card("No activity in this period", "Try a longer range.")
+            self.empty_range_hint(s, rk, "proj_range", PROJ_RANGE_OPTS, lambda v: v,
+                                  "No activity in this period")
             return
         total = sum(p["val"] for p in rows) or 1.0
         body, _ = self.card(self.content, f"{len(rows)} project{'s' if len(rows) != 1 else ''}",
@@ -4424,41 +4895,385 @@ class App:
             second = f"{fmt_tokens(tok(p['agg']))} tok" if metric == "cost" else fmt_cost(p["agg"][4])
             info = (f"{second} · {p['agg'][5]:,} msgs · {p['sess']} session{'s' if p['sess'] != 1 else ''} · "
                     f"active {fmt_ago(s['now'] - p['last'])}")
+            if p.get("branch"):
+                info += f" · {p['branch']}"
+                if p.get("n_branches", 1) > 1:
+                    info += f" (+{p['n_branches'] - 1})"
             self.lbl(r, self.elide(info, self.f["tiny"], self.CW), "tiny", "muted").pack(anchor="w")
         if len(rows) > 8:
             rest = sum(p["val"] for p in rows[8:])
             self.lbl(body, f"+ {len(rows) - 8} more · {fmt_metric(rest, metric)}", "tiny", "muted").pack(anchor="w", pady=(px(8), 0))
 
-    # ---------------------------------------------------------------- sessions
+    # ------------------------------------------------- live sessions (groups)
     def render_sessions(self, s):
         th, px = self.th, self.px
+        self._sess_entry = None
         if self.no_data(s):
             return
-        metric, sess = s["metric"], s["sessions"]
-        body, _ = self.card(self.content, "Recent sessions",
-                            f"{s['n_sessions']:,} in {self.cfg['history_days']} days")
-        for i, x in enumerate(sess[:9]):
-            r = tk.Frame(body, bg=th["surface"])
-            r.pack(fill="x", pady=(0 if i == 0 else px(9), 0))
-            t = tk.Frame(r, bg=th["surface"])
-            t.pack(fill="x")
-            if x["live"]:
-                self.lbl(t, " LIVE ", "tinyb", th["accent"], bg=th["accent_soft"]).pack(side="left", padx=(0, px(6)))
-            self.lbl(t, self.elide(x["project"], self.f["bodyb"], self.CW - px(150)), "bodyb").pack(side="left")
-            self.lbl(t, fmt_metric(x["val"], metric), "smallb").pack(side="right")
-            if x.get("cc_cost") and metric == "cost":
-                self.lbl(t, f"CC {fmt_cost(x['cc_cost'])}", "tiny", "muted").pack(side="right", padx=(0, px(6)))
-            b = tk.Frame(r, bg=th["surface"])
-            b.pack(fill="x", pady=(px(3), 0))
-            self.shape(b, "swatch", th["series"][x["fam"]], 7).pack(side="left", padx=(0, px(5)))
-            model = x["model"] + (f" +{x['n_models'] - 1}" if x["n_models"] > 1 else "")
-            dur = fmt_dur(x["last"] - x["first"])
-            when = day_label(local_day(x["first"]), s["today"])
-            when = fmt_clock(x["first"]) if when == "Today" else f"{when} {fmt_clock(x['first'])}"
-            second = f"{fmt_tokens(tok(x['agg']))} tok" if metric == "cost" else fmt_cost(x["agg"][4])
-            info = self.elide(f"{model} · {when} · {dur} · {x['agg'][5]:,} msgs · {second}", self.f["tiny"],
-                              self.CW - px(16))
-            self.lbl(b, info, "tiny", "muted").pack(side="left")
+        metric = s["metric"]
+        self.lbl(self.content, self.local_note(s), "tiny", "muted").pack(anchor="w", pady=(0, px(8)))
+        groups = s.get("groups") or []
+        anomalies = s.get("anomalies") or {}
+        if not groups:
+            self.empty_card("No grouped sessions",
+                            "Your logs hold usage, but nothing could be grouped by project. "
+                            "Try a longer history window.")
+            return
+        self.render_session_kpis(s, groups)
+        fams = sorted({r["fam"] for g in groups for r in g["runs"] if r.get("fam") in FAM_LABEL})
+        self.render_session_filters(s, groups, fams)
+        shown = filter_runs(groups, self._sess_query, self._sess_state, self._sess_fam)
+        if not shown:
+            body, _ = self.card(self.content, "No matching runs")
+            self.lbl(body, "Nothing matches this filter. Clear the search or pick another state.",
+                     "small", "muted", justify="left", wraplength=self.CW).pack(anchor="w")
+            return
+        total = sum(g["val"] for g in shown) or 1.0
+        mx = shown[0]["val"] or 1.0
+        n_runs = sum(len(g["runs"]) for g in shown)
+        body, _ = self.card(self.content, "Project & branch groups",
+                            "%d groups · %d runs · %s" % (len(shown), n_runs, fmt_metric(total, metric)))
+        for i, g in enumerate(shown):
+            self.render_session_group(body, s, g, mx, anomalies.get((g["project"], g["branch"])),
+                                      first=(i == 0))
+        sel = self.session_selection(shown)
+        if sel is not None:
+            self.render_session_inspector(s, shown, sel)
+
+    def render_session_kpis(self, s, groups):
+        """Four real figures: live runs, 7-day spend, 30-day tokens+cache hit, top group."""
+        th, px, metric = self.th, self.px, s["metric"]
+        body, _ = self.card(self.content)
+        live_n = sum(g["live"] for g in groups)
+        n_runs = sum(len(g["runs"]) for g in groups)
+        k7, k30 = s["kpi"]["7d"], s["kpi"]["30d"]
+        avg = (mval(k7["agg"], metric) / k7["sess"]) if k7["sess"] else 0.0
+        hit = cache_hit_rate(k30["agg"])
+        top = groups[0]
+        top_name = top["project"] + (" · " + top["branch"] if top["branch"] else "")
+        cells = [
+            ("Live now", "%d live" % live_n,
+             "%d run%s in view" % (n_runs, "" if n_runs == 1 else "s"),
+             "Live runs (last activity under 15 minutes ago): %d of %d" % (live_n, n_runs)),
+            ("7 days", fmt_metric(mval(k7["agg"], metric), metric),
+             ("avg %s / run" % fmt_metric(avg, metric)) if k7["sess"] else "no runs",
+             "7-day %s: %s across %d session%s" % (
+                 METRIC_NAME[metric], fmt_exact_cost(k7["agg"][4]) if metric == "cost"
+                 else fmt_exact_tokens(tok(k7["agg"])), k7["sess"], "" if k7["sess"] == 1 else "s")),
+            ("30 days", fmt_metric(mval(k30["agg"], metric), metric),
+             "cache hit %s" % (fmt_pct(hit * 100) if hit is not None else "—"),
+             "30-day tokens: in %s · out %s · cache write %s · cache read %s" % (
+                 fmt_exact_tokens(k30["agg"][0]), fmt_exact_tokens(k30["agg"][1]),
+                 fmt_exact_tokens(k30["agg"][2]), fmt_exact_tokens(k30["agg"][3]))),
+            ("Top group", top_name,
+             "%s · %s" % (fmt_metric(top["val"], metric), fmt_pct(top["share"] * 100)),
+             "%s holds %s of the total (%s)" % (top_name, fmt_pct(top["share"] * 100),
+                                                fmt_metric(top["val"], metric))),
+        ]
+        for r in (0, 1):
+            for c in (0, 1):
+                i = r * 2 + c
+                if c:
+                    tk.Frame(body, bg=th["border"], width=1).grid(row=r * 2, column=1, sticky="ns", padx=px(10))
+                col = tk.Frame(body, bg=th["surface"])
+                col.grid(row=r * 2, column=c * 2, sticky="nw", pady=(px(8) if r else 0, 0))
+                label, value, sub, tip = cells[i]
+                self.lbl(col, label, "tiny", "muted").pack(anchor="w")
+                self.lbl(col, self.elide(value, self.f["bodyb"], self.CW // 2 - px(24)),
+                         "bodyb").pack(anchor="w")
+                self.lbl(col, self.elide(sub, self.f["tiny"], self.CW // 2 - px(24)),
+                         "tiny", "ink2").pack(anchor="w")
+                for w in [col] + col.winfo_children():
+                    w.bind("<Enter>", lambda e, t=tip: self.tip.show(t, e.x_root, e.y_root))
+                    w.bind("<Leave>", lambda e: self.tip.hide())
+        body.grid_columnconfigure((0, 2), weight=1, uniform="skpi")
+
+    def render_session_filters(self, s, groups, fams):
+        """Search box (applies as you type) + state pills + model-family chips."""
+        th, px = self.th, self.px
+        bar = tk.Frame(self.content, bg=th["bg"])
+        bar.pack(fill="x", pady=(0, px(8)))
+        box = tk.Frame(bar, bg=th["seg_bg"], highlightthickness=1, highlightbackground=th["border"])
+        box.pack(fill="x")
+        hint = "Filter by project, branch or session…"
+        e = tk.Entry(box, bg=th["seg_bg"],
+                     fg=th["ink"] if self._sess_query else th["muted"],
+                     insertbackground=th["ink"], relief="flat", highlightthickness=0,
+                     font=self.f["small"], width=1)
+        e.pack(side="left", fill="x", expand=True, padx=(px(8), 0), pady=px(5))
+        e.insert(0, self._sess_query or hint)
+
+        def apply():
+            txt = e.get()
+            if txt == hint:
+                txt = ""
+            txt = txt.strip()
+            if txt != self._sess_query:
+                self._sess_query = txt
+                self.render()
+                ent = self._sess_entry
+                if ent is not None and ent.winfo_exists():
+                    try:
+                        ent.focus_set()
+                        ent.icursor("end")
+                    except tk.TclError:
+                        pass
+
+        def on_focus_in(_ev):
+            if e.get() == hint and not self._sess_query:
+                e.delete(0, "end")
+                e.configure(fg=th["ink"])
+
+        def on_focus_out(_ev):
+            if not e.get().strip() or e.get() == hint:
+                if self._sess_query:
+                    return  # a query is applied; the next render restores it
+                e.delete(0, "end")
+                e.insert(0, hint)
+                e.configure(fg=th["muted"])
+
+        e.bind("<FocusIn>", on_focus_in)
+        e.bind("<FocusOut>", on_focus_out)
+        e.bind("<KeyRelease>", lambda _ev: apply())
+        self._sess_entry = e
+        if self._sess_query:
+            clear = tk.Label(box, text="×", font=self.f["smallb"], fg=th["muted"],
+                             bg=th["seg_bg"], cursor="hand2")
+            clear.pack(side="right", padx=px(6))
+
+            def wipe(_ev):
+                self._sess_query = ""
+                self.render()
+
+            clear.bind("<ButtonRelease-1>", wipe)
+        pills = tk.Frame(bar, bg=th["bg"])
+        pills.pack(fill="x", pady=(px(6), 0))
+        counts = {"all": 0, "running": 0, "completed": 0}
+        fam_counts = {}
+        for g in groups:
+            for r in g["runs"]:
+                counts["all"] += 1
+                counts[run_state(r)] += 1
+                fam_counts[r.get("fam")] = fam_counts.get(r.get("fam"), 0) + 1
+        self.segmented(pills, [("all", "All (%d)" % counts["all"]),
+                               ("running", "Running (%d)" % counts["running"]),
+                               ("completed", "Done (%d)" % counts["completed"])],
+                       self._sess_state, self.set_sess_state).pack(side="left")
+        if len(fams) > 1:
+            chips = tk.Frame(bar, bg=th["bg"])
+            chips.pack(fill="x", pady=(px(6), 0))
+            self.segmented(chips, [("all", "All models")] +
+                           [(fm, "%s (%d)" % (FAM_LABEL[fm], fam_counts.get(fm, 0))) for fm in fams],
+                           self._sess_fam, self.set_sess_fam).pack(side="left")
+
+    def set_sess_state(self, key):
+        self._sess_state = key
+        self.render()
+
+    def set_sess_fam(self, key):
+        self._sess_fam = key
+        self.render()
+
+    def render_session_group(self, parent, s, g, mx, anomaly, first=False):
+        """One project+branch accordion block; runs render only when expanded."""
+        th, px, metric = self.th, self.px, s["metric"]
+        key = (g["project"], g["branch"])
+        opened = self._sess_expanded.get(key)
+        if opened is None:
+            opened = bool(g["live"]) or anomaly is not None or first
+            self._sess_expanded[key] = opened
+        r = tk.Frame(parent, bg=th["surface"])
+        r.pack(fill="x", pady=(0 if first else px(10), 0))
+        h = tk.Frame(r, bg=th["surface"])
+        h.pack(fill="x")
+        chev = tk.Label(h, text="▾ " if opened else "▸ ", font=self.f["smallb"],
+                        fg=th["muted"], bg=th["surface"], cursor="hand2")
+        chev.pack(side="left")
+        if g["live"]:
+            self.lbl(h, " LIVE ", "tinyb", th["accent"], bg=th["accent_soft"]).pack(side="left",
+                                                                                   padx=(0, px(6)))
+        name = g["project"] + (" · " + g["branch"] if g["branch"] else "")
+        self.lbl(h, self.elide(name, self.f["bodyb"], self.CW - px(150)), "bodyb").pack(side="left")
+        self.lbl(h, fmt_metric(g["val"], metric), "smallb").pack(side="right")
+        if anomaly is not None:
+            acolor = STATUS["crit"] if g["share"] >= ANOMALY_SHARE else STATUS["warn"]
+            self.shape(h, "triangle", acolor, 8).pack(side="left", padx=(px(6), px(3)))
+            self.lbl(h, "Concentration", "tinyb", acolor).pack(side="left")
+
+        def toggle(_ev=None, k=key):
+            self._sess_expanded[k] = not self._sess_expanded.get(k, False)
+            self.render()
+
+        for w in [h, chev] + h.winfo_children():
+            w.bind("<ButtonRelease-1>", toggle)
+        second = "%d run%s · %s · %s · active %s" % (
+            len(g["runs"]), "" if len(g["runs"]) == 1 else "s",
+            fmt_pct(g["share"] * 100), "%s tok" % fmt_tokens(g["tokens"]),
+            fmt_ago(s["now"] - g["last"]))
+        self.lbl(r, self.elide(second, self.f["tiny"], self.CW), "tiny", "muted").pack(anchor="w")
+        self.meter(r, g["val"] / mx, th["accent"], height=5).pack(anchor="w", pady=(px(4), px(3)))
+        if anomaly is not None:
+            self.lbl(r, "Concentration: this group " + anomaly["reason"] + ".",
+                     "tiny", "ink2", justify="left", wraplength=self.CW).pack(anchor="w")
+        if not opened:
+            return
+        for x in g["runs"][:SESS_RUN_CAP]:
+            self.render_session_run(r, s, x)
+        if len(g["runs"]) > SESS_RUN_CAP:
+            rest = sum(x["val"] for x in g["runs"][SESS_RUN_CAP:])
+            self.lbl(r, "+ %d earlier runs · %s" % (len(g["runs"]) - SESS_RUN_CAP,
+                                                    fmt_metric(rest, metric)),
+                     "tiny", "muted").pack(anchor="w", pady=(px(6), 0))
+
+    def render_session_run(self, parent, s, x):
+        """One run row; clicking it pins the inspector below."""
+        th, px, metric = self.th, self.px, s["metric"]
+        selected = self._sess_selected == x["id"]
+        bg = th["accent_soft"] if selected else th["surface"]
+        r = tk.Frame(parent, bg=bg)
+        r.pack(fill="x", pady=(px(6), 0), padx=(px(14), 0))
+        t = tk.Frame(r, bg=bg)
+        t.pack(fill="x")
+        if x["live"]:
+            tk.Label(t, text=" LIVE ", font=self.f["tinyb"], fg=th["accent"], bg=bg).pack(
+                side="left", padx=(0, px(6)))
+        model = x["model"] + (" +%d" % (x["n_models"] - 1) if x["n_models"] > 1 else "")
+        tk.Label(t, text=self.elide(model, self.f["smallb"], self.CW - px(190)), font=self.f["smallb"],
+                 fg=th["ink"], bg=bg).pack(side="left")
+        tk.Label(t, text="›", font=self.f["smallb"], fg=th["muted"], bg=bg).pack(side="right")
+        tk.Label(t, text=fmt_metric(x["val"], metric), font=self.f["smallb"],
+                 fg=th["ink"], bg=bg).pack(side="right", padx=(0, px(6)))
+        if x.get("cc_cost") and metric == "cost":
+            tk.Label(t, text="CC " + fmt_cost(x["cc_cost"]), font=self.f["tiny"],
+                     fg=th["muted"], bg=bg).pack(side="right", padx=(0, px(6)))
+        dur = fmt_dur(x["last"] - x["first"])
+        when = day_label(local_day(x["first"]), s["today"])
+        when = fmt_clock(x["first"]) if when == "Today" else "%s %s" % (when, fmt_clock(x["first"]))
+        second = "%s · %s · %s · %s msgs · %s" % (
+            x["id"][:8], when, dur, f"{x['agg'][5]:,}",
+            ("%s tok" % fmt_tokens(tok(x["agg"]))) if metric == "cost" else fmt_cost(x["agg"][4]))
+        info = tk.Label(r, text=self.elide(second, self.f["tiny"], self.CW - px(14)),
+                        font=self.f["tiny"], fg=th["muted"], bg=bg)
+        info.pack(anchor="w")
+
+        def pick(_ev=None, sid=x["id"]):
+            self._sess_selected = sid
+            self.render()
+
+        for w in [r, t, info] + t.winfo_children():
+            w.bind("<ButtonRelease-1>", pick)
+
+    def session_selection(self, groups):
+        """Selected run when still visible, else the newest run of the richest group."""
+        for g in groups:
+            for x in g["runs"]:
+                if x["id"] == self._sess_selected:
+                    return x
+        if groups and groups[0]["runs"]:
+            self._sess_selected = groups[0]["runs"][0]["id"]
+            return groups[0]["runs"][0]
+        return None
+
+    def render_session_inspector(self, s, groups, x):
+        """Read-only detail for one run: token legs, cache insight, billed total, export."""
+        th, px, metric = self.th, self.px, s["metric"]
+        agg = x["agg"]
+        g = next((g for g in groups if any(r["id"] == x["id"] for r in g["runs"])), None)
+        anomaly = (s.get("anomalies") or {}).get((x["project"], x.get("branch") or "")) if g else None
+        body, _ = self.card(self.content, "Session detail", x["id"][:8])
+        title = x["project"] + (" · " + x["branch"] if x.get("branch") else "")
+        self.lbl(body, self.elide(title, self.f["bodyb"], self.CW), "bodyb").pack(anchor="w")
+        dur = fmt_dur(x["last"] - x["first"])
+        when = day_label(local_day(x["first"]), s["today"])
+        when = fmt_clock(x["first"]) if when == "Today" else "%s %s" % (when, fmt_clock(x["first"]))
+        model = x["model"] + (" +%d" % (x["n_models"] - 1) if x["n_models"] > 1 else "")
+        self.lbl(body, "%s · %s · %s · %s msgs" % (model, when, dur, f"{agg[5]:,}"),
+                 "tiny", "muted").pack(anchor="w", pady=(px(2), 0))
+        if anomaly is not None:
+            acolor = STATUS["crit"] if g["share"] >= ANOMALY_SHARE else STATUS["warn"]
+            row = tk.Frame(body, bg=th["surface"])
+            row.pack(fill="x", pady=(px(8), 0))
+            self.shape(row, "triangle", acolor, 9).pack(side="left", padx=(0, px(6)))
+            self.lbl(row, "Concentration: this group " + anomaly["reason"] + ".",
+                     "small", "ink2", justify="left",
+                     wraplength=self.CW - px(20)).pack(side="left")
+        legs = tk.Frame(body, bg=th["surface"])
+        legs.pack(fill="x", pady=(px(10), 0))
+        self.lbl(legs, "TOKEN LEGS", "label", "muted").pack(side="left")
+        self.lbl(legs, "%s · %s" % (fmt_exact_tokens(tok(agg)), fmt_exact_cost(agg[4])),
+                 "tiny", "ink2").pack(side="right")
+        mx = max([t for _, t in session_waterfall(agg)] or [1]) or 1
+        for label, tokens in session_waterfall(agg):
+            lr = tk.Frame(body, bg=th["surface"])
+            lr.pack(fill="x", pady=(px(5), 0))
+            self.lbl(lr, label, "tiny", "ink2").pack(side="left")
+            self.lbl(lr, fmt_exact_tokens(tokens), "tiny", "ink").pack(side="right")
+            self.meter(body, tokens / mx, th["series"][x["fam"]], height=5).pack(anchor="w",
+                                                                                pady=(px(2), 0))
+        hit = cache_hit_rate(agg)
+        if hit is None:
+            cache_txt = "No input-side tokens in this session, so there is no cache rate."
+        else:
+            cache_txt = ("Cache hit %s — %s of %s input-side tokens were served from cache. "
+                         "Cache reads are priced a fraction of fresh input, so a high rate "
+                         "holds the cost down." % (
+                             fmt_pct(hit * 100), fmt_exact_tokens(agg[3]),
+                             fmt_exact_tokens(agg[0] + agg[2] + agg[3])))
+        self.lbl(body, cache_txt, "tiny", "ink2", justify="left",
+                 wraplength=self.CW).pack(anchor="w", pady=(px(8), 0))
+        if x.get("cc_cost"):
+            logs, cc = agg[4], x["cc_cost"]
+            match = (1 - abs(cc - logs) / cc) * 100 if cc > 0 else 100.0
+            self.lbl(body, "Claude Code billed %s · logs %s · %.1f%% match" % (
+                fmt_exact_cost(cc), fmt_exact_cost(logs), match),
+                     "tiny", "muted", justify="left", wraplength=self.CW).pack(anchor="w")
+        row = tk.Frame(body, bg=th["surface"])
+        row.pack(anchor="w", pady=(px(10), 0))
+        self.button(row, "Copy session ID", lambda: self.copy_session_id(x["id"])).pack(
+            side="left", padx=(0, px(8)))
+        self.button(row, "Export group (.json)",
+                    lambda: self.export_run_group(s, g, x)).pack(side="left")
+
+    def copy_session_id(self, sid):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(sid)
+            self.flash_toast("Session ID copied")
+        except tk.TclError:
+            self.flash_toast("Couldn't reach the clipboard")
+
+    def export_run_group(self, s, g, x):
+        """Write the selected group as metadata JSON (counts and costs only, never prompts)."""
+        if g is None:
+            return
+        try:
+            path = filedialog.asksaveasfilename(
+                defaultextension=".json",
+                initialfile="%s-%s-runs.json" % (g["project"], x["id"][:8]),
+                filetypes=[("JSON", "*.json"), ("All files", "*.*")])
+        except (tk.TclError, OSError):
+            return
+        if not path:
+            return
+        try:
+            data = {"exported_by": "%s %s" % (APP_NAME, VERSION),
+                    "metric": s["metric"],
+                    "group": {"project": g["project"], "branch": g["branch"],
+                              "val": g["val"], "share": g["share"], "tokens": g["tokens"],
+                              "msgs": g["msgs"]},
+                    "runs": [{"id": r["id"], "model": r["model"], "fam": r["fam"],
+                              "first": r["first"], "last": r["last"],
+                              "msgs": r["agg"][5],
+                              "tokens": {"input": r["agg"][0], "output": r["agg"][1],
+                                         "cache_write": r["agg"][2], "cache_read": r["agg"][3]},
+                              "cost": r["agg"][4],
+                              "cc_cost": r.get("cc_cost")} for r in g["runs"]]}
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+                fh.write("\n")
+            self.flash_toast("Group exported")
+        except OSError:
+            self.flash_toast("Couldn't write that file")
 
     # ---------------------------------------------------------------- mini & banner
     def render_mini(self, s):
@@ -4744,7 +5559,8 @@ class App:
 class BarChart:
     """Stacked columns by model family with a per-column hover tooltip."""
 
-    def __init__(self, app, parent, width, height, buckets, metric, xlabel, tipfn, mark_last=False):
+    def __init__(self, app, parent, width, height, buckets, metric, xlabel, tipfn, mark_last=False,
+                 peak=False, values=False, avg_window=0):
         self.app, self.buckets, self.tipfn, self.hi = app, buckets, tipfn, None
         th, f, px = app.th, app.f, app.px
         c = self.c = tk.Canvas(parent, width=width, height=height, bg=th["surface"], highlightthickness=0, bd=0)
@@ -4766,6 +5582,7 @@ class BarChart:
         self.slot = (self.x1 - self.x0) / max(1, n)
         bw = max(2.0, min(px(22), self.slot * 0.68))
         gap = max(1.0, px(1.5))
+        pi = max(range(len(buckets)), key=lambda i: totals[i]) if (peak and mx > 0 and buckets) else None
         for i, b in enumerate(buckets):
             cx = self.x0 + (i + 0.5) * self.slot
             xa, xb = cx - bw / 2.0, cx + bw / 2.0
@@ -4780,6 +5597,7 @@ class BarChart:
                     c.create_rectangle(xa, ya + gap, xb, y, fill=th["series"][fm], width=0)
                 y = ya
             lab = xlabel(i, b)
+            tot = totals[i]
             if mark_last and i == n - 1:
                 txt = lab or "now"
                 half = f["tinyb"].measure(txt) / 2.0
@@ -4787,6 +5605,29 @@ class BarChart:
                 c.create_text(tx, self.y1 + px(3), text=txt, anchor="n", font=f["tinyb"], fill=th["accent"])
             elif lab and not (mark_last and (n - 1 - i) * self.slot < px(24)):
                 c.create_text(cx, self.y1 + px(3), text=lab, anchor="n", font=f["tiny"], fill=th["muted"])
+            if values and tot > 0 and i != pi:   # the peak bucket gets its own marker + label below
+                txt = fmt_axis(tot, metric)
+                half = f["smallb"].measure(txt) / 2.0
+                ty = max(self.y0 + px(4), min(y - px(4), self.y1 - px(4)))
+                c.create_text(cx, ty, text=txt, anchor="s", font=f["smallb"], fill=th["ink2"])
+        if pi is not None:
+            cx = self.x0 + (pi + 0.5) * self.slot
+            py = max(self.y0, min(self.y1 - mx / top * ph - px(6), self.y1 - px(6)))
+            c.create_oval(cx - px(2), py - px(2), cx + px(2), py + px(2), fill=th["accent"], outline="")
+            txt = fmt_axis(mx, metric)
+            half = f["smallb"].measure(txt) / 2.0
+            tx = min(max(cx, self.x0 + half + 2), self.x1 - half - 2)
+            c.create_text(tx, py - px(8), text=txt, anchor="s", font=f["smallb"], fill=th["ink2"])
+        if avg_window and mx > 0 and len(buckets) >= avg_window:
+            run, pts = 0.0, []
+            for i, v in enumerate(totals):
+                run += v
+                if i >= avg_window:
+                    run -= totals[i - avg_window]
+                if i >= avg_window - 1:   # a 7-day average needs 7 days; never draw partial windows
+                    pts.append((self.x0 + (i + 0.5) * self.slot, self.y1 - run / avg_window / top * ph))
+            if len(pts) > 1:
+                c.create_line(pts, fill=mix(th["accent"], th["ink"], 0.25), width=max(1.0, px(1.5)), dash=(4, 3))
         if mx <= 0:
             c.create_text((self.x0 + self.x1) / 2, (self.y0 + self.y1) / 2, text="No usage in this period",
                           font=f["small"], fill=th["muted"])
@@ -4806,6 +5647,90 @@ class BarChart:
                                     width=0, tags="hover")
             self.c.tag_lower("hover")
         self.app.tip.show(self.tipfn(i), e.x_root, e.y_root)
+
+    def leave(self, _e=None):
+        self.hi = None
+        self.c.delete("hover")
+        self.app.tip.hide()
+
+
+class CumulativeChart:
+    """Running-total staircase: each bucket's usage is added to the running total, so
+    days with no activity read as flat steps (an explicit 'nothing happened' row)."""
+
+    def __init__(self, app, parent, width, height, buckets, metric, xlabel, tipfn, mark_last=True):
+        self.app, self.buckets, self.tipfn, self.hi = app, buckets, tipfn, None
+        th, f, px = app.th, app.f, app.px
+        c = self.c = tk.Canvas(parent, width=width, height=height, bg=th["surface"], highlightthickness=0, bd=0)
+        c.pack(anchor="w")
+        day_vals = [sum(b["fam"].values()) for b in buckets]
+        cum, run = [], 0.0
+        for v in day_vals:
+            run += v
+            cum.append(run)
+        self.cum, self.metric = cum, metric
+        mx = run
+        step, top = nice_scale(mx)
+        ticks = [step * i for i in range(1, int(round(top / step)) + 1)] if mx > 0 else []
+        labels = [fmt_axis(t, metric) for t in ticks]
+        lw = max([f["tiny"].measure(t) for t in labels] + [px(10)]) + px(7)
+        self.x0, self.x1, self.y0, self.y1 = lw, width - 1, px(6), height - px(16)
+        ph = self.y1 - self.y0
+        for t, lab in zip(ticks, labels):
+            y = self.y1 - t / top * ph
+            c.create_line(self.x0, y, self.x1, y, fill=th["grid"])
+            c.create_text(self.x0 - px(6), y, text=lab, anchor="e", font=f["tiny"], fill=th["muted"])
+        c.create_line(self.x0, self.y1, self.x1, self.y1, fill=th["base"])
+        n = len(buckets)
+        self.slot = (self.x1 - self.x0) / max(1, n)
+        if mx > 0:
+            poly = [(self.x0, self.y1)]
+            for i in range(n):
+                y = self.y1 - cum[i] / top * ph
+                xb = self.x0 + (i + 1) * self.slot
+                poly.append((self.x0 + i * self.slot, y))
+                poly.append((xb, y))
+            poly.append((self.x1, self.y1))
+            c.create_polygon(poly, fill=mix(th["accent"], th["surface"], 0.88), outline="")
+            for i in range(n):
+                xa, xb = self.x0 + i * self.slot, self.x0 + (i + 1) * self.slot
+                y = self.y1 - cum[i] / top * ph
+                c.create_line(xa, y, xb, y, fill=th["accent"], width=max(1.0, px(1)))
+                if i < n - 1:
+                    c.create_line(xb, y, xb, self.y1 - cum[i + 1] / top * ph, fill=th["accent"],
+                                  width=max(1.0, px(1)))
+        if mark_last and n:
+            xb = self.x0 + n * self.slot
+            if xb > self.x0 + self.slot * 0.5:
+                c.create_line(xb - px(4), self.y0 - 2, xb - px(4), self.y1, fill=th["border"], dash=(2, 2))
+                txt = "now"
+                half = f["tinyb"].measure(txt) / 2.0
+                c.create_text(min(xb - px(6), self.x1 - half - 1), self.y1 + px(3), text=txt, anchor="n",
+                              font=f["tinyb"], fill=th["accent"])
+        for i, b in enumerate(buckets):
+            cx = self.x0 + (i + 0.5) * self.slot
+            lab = xlabel(i, b)
+            if lab:
+                c.create_text(cx, self.y1 + px(3), text=lab, anchor="n", font=f["tiny"], fill=th["muted"])
+        if mx <= 0:
+            c.create_text((self.x0 + self.x1) / 2, (self.y0 + self.y1) / 2, text="No usage in this period",
+                          font=f["small"], fill=th["muted"])
+        c.bind("<Motion>", self.motion)
+        c.bind("<Leave>", self.leave)
+
+    def motion(self, e):
+        n = len(self.buckets)
+        if not n or e.x < self.x0 or e.x > self.x1:
+            return self.leave()
+        i = max(0, min(n - 1, int((e.x - self.x0) / self.slot)))
+        if i != self.hi:
+            self.hi = i
+            self.c.delete("hover")
+            xa = self.x0 + i * self.slot
+            self.c.create_rectangle(xa + 1, self.y0 - 2, xa + self.slot - 1, self.y1,
+                                    outline=self.app.th["ink"], width=1, tags="hover")
+        self.app.tip.show(f"{self.tipfn(i)}\nrunning total {fmt_metric(self.cum[i], self.metric)}",
+                      e.x_root, e.y_root)
 
     def leave(self, _e=None):
         self.hi = None

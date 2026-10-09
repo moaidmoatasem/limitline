@@ -4,6 +4,8 @@
 
 **Window is empty / "no data"**: Claude Code has not written logs yet, or they are elsewhere. Add the folder in Settings (extra paths) or use `--path DIR`.
 
+**Ring/limits show high usage but the History or Projects tabs are empty**: that's expected. The ring and plan bars are Anthropic's account-wide numbers (they include claude.ai, the desktop app, cloud and other PCs); the log tabs only cover this computer's Claude Code. If the tabs are *older* but not empty, use the "Show …" button that appears on an empty range to widen it to your newest activity.
+
 **No live limits / "Not connected yet"**: run `python limitline.py --install-statusline` (or Settings > Connect), then send a message in Claude Code. Limits only exist for Pro/Max accounts and appear after the first response of a session. If you already had a status line it keeps working. Undo with `--uninstall-statusline`.
 
 **Percent looks old**: Claude Code only reports while it is open; the card shows the age.

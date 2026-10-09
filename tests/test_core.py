@@ -73,6 +73,13 @@ deep = c.LogStore._project(r"\\wsl.localhost\ubuntu-24.04\home\moaid\cherenkov-q
 check(deep == "cherenkov-qa", f"subfolder cwd -> project under home ({deep})")
 one = c.LogStore._project(r"C:\Users\moaid\code\proj\src", "x.jsonl")
 check(one == "src", f"single generic folder left alone ({one})")
+check(c.LogStore._branch("origin/feature-auth") == "origin/feature-auth", "branch kept verbatim")
+check(c.LogStore._branch("  main  ") == "main", "branch whitespace stripped")
+check(c.LogStore._branch("") == "" and c.LogStore._branch(None) == ""
+      and c.LogStore._branch(42) == "" and c.LogStore._branch("   ") == "",
+      "missing/non-string/blank branch becomes empty")
+check(c.LogStore._branch("x" * 200) == "x" * 80, "branch capped at 80 chars")
+check(getattr(A, "branch", None) == "main", f"log gitBranch captured on entries ({getattr(A, 'branch', None)!r})")
 
 # incremental: complete the partial line + append new message
 with open(f1, "a") as fh:
@@ -215,6 +222,18 @@ check(abs(wbs[0]["fam"]["opus"] - 21.0) < 1e-9 and abs(wbs[0]["agg"][0] - 21.0) 
       f"first week sums its 7 days (fam {wbs[0]['fam']['opus']}, msgs {wbs[0]['agg'][5]})")
 check(abs(sum(b["fam"].get("opus", 0.0) for b in wbs) - 45.0) < 1e-9, "weekly totals conserve the daily sums")
 check(abs(sum(p["val"] for p in snap["projects"]["7d"]) - snap["kpi"]["7d"]["agg"][4]) < 1e-6, "projects 7d == 7d total")
+# project rows carry their top branch (most frequent wins) + branch count
+t0 = now - 3600
+es2 = [c.make_entry(t0, "m", "sonnet", "Sonnet 5", 10, 20, 0, 0, 0.01, "projx", "sa", "main"),
+       c.make_entry(t0 + 10, "m", "sonnet", "Sonnet 5", 10, 20, 0, 0, 0.01, "projx", "sb", "feature-z"),
+       c.make_entry(t0 + 20, "m", "sonnet", "Sonnet 5", 10, 20, 0, 0, 0.01, "projx", "sc", "feature-z")]
+snapB = c.build_snapshot(es2, now, cfg, {"status": "off"}, {"roots": [], "files": 0, "entries": 3})
+pb = snapB["projects"]["30d"]
+check(len(pb) == 1 and pb[0]["branch"] == "feature-z" and pb[0]["n_branches"] == 2,
+      f"project top branch resolves by frequency ({pb[0] if pb else None})")
+check(all(isinstance(p.get("branch"), str) and isinstance(p.get("n_branches"), int)
+          for p in snap["projects"]["30d"]),
+      "every project row carries branch fields")
 check(abs(sum(sum(b["fam"].values()) for b in snap["hourly"]) - sum(e.cost for e in es if e.ts >= snap["hourly"][0]["start"])) < 1e-6, "hourly sums")
 w = snap["window"]
 check(abs(w["val"] - sum(e.cost for e in es if w["start"] <= e.ts < w["end"])) < 1e-9, "window total")
@@ -230,6 +249,110 @@ check(snap3["limit_src"] == "custom" and abs(snap3["gauge"]["pct"] - snap3["wind
 # empty
 snap4 = c.build_snapshot([], time.time(), cfg, {"status": "off"}, {"roots": [], "files": 0, "entries": 0})
 check(snap4["window"] is None and not snap4["has_data"], "empty snapshot ok")
+check(snap4["groups"] == [] and snap4["anomalies"] == {}, "empty snapshot has no groups or anomalies")
+
+# ---- run groups / anomalies / waterfall / filter (Live Sessions) ----------------
+check(c.session_branch({}, "") == "" and c.session_branch({"main": 2}, "main") == "main",
+      "session branch resolves from counts")
+check(c.session_branch({"a": 1, "b": 1}, "b") == "b", "session branch ties break to last seen")
+groups = snap["groups"]
+check(isinstance(groups, list) and len(groups) >= 1, f"snapshot builds run groups ({len(groups)})")
+check(all(set(("project", "branch", "runs", "val", "tokens", "msgs", "first", "last",
+               "live", "models", "share")) <= set(g) for g in groups),
+      "groups carry project/branch/runs/totals/share")
+check([g["val"] for g in groups] == sorted([g["val"] for g in groups], reverse=True),
+      "groups are ordered richest first")
+check(all(g["runs"] == sorted(g["runs"], key=lambda r: -r["last"]) for g in groups),
+      "runs inside a group are newest first")
+gtot = sum(g["val"] for g in groups)
+atol = sum(x["val"] for x in snap["sessions"])
+check(gtot >= atol - 1e-9, f"groups cover at least the top-15 sessions ({gtot:.4f} >= {atol:.4f})")
+check(abs(sum(g["share"] for g in groups) - (1.0 if gtot > 0 else 0.0)) < 1e-9,
+      "group shares sum to 1")
+check(all(r.get("branch", "") == g["branch"] and r.get("project") == g["project"]
+          for g in groups for r in g["runs"]),
+      "every run sits under its own project+branch group")
+br = [x.get("branch") for x in snap["sessions"]]
+check(all(isinstance(b, str) for b in br), "every session carries a branch string")
+# anomalies: cautious wording, share + absolute rules
+big = [{"project": "p", "branch": "b", "val": 60.0, "share": 0.6, "runs": []},
+       {"project": "q", "branch": "", "val": 10.0, "share": 0.14, "runs": []}]
+an = c.detect_anomalies(big, "cost")
+check(len(an) == 1 and an[0]["project"] == "p" and "recursive" not in an[0]["reason"]
+      and "loop" not in an[0]["reason"], f"concentration flagged without claiming a cause ({an})")
+rich = [{"project": "p", "branch": "", "val": 30.0, "share": 0.2, "runs": []}]
+check(len(c.detect_anomalies(rich, "cost")) == 1, "a group over $25 is flagged even at low share")
+check(c.detect_anomalies(rich, "tokens") == [], "the dollar rule applies to the cost metric only")
+check(c.detect_anomalies([], "cost") == [], "no groups means no anomalies")
+# waterfall: token legs, largest first, totals conserved
+agg6 = [100, 400, 50, 850, 1.23, 7]
+legs = c.session_waterfall(agg6)
+check([t for _, t in legs] == sorted([100, 400, 50, 850], reverse=True),
+      f"waterfall legs are token counts, largest first ({legs})")
+check(sum(t for _, t in legs) == 1400, "waterfall legs conserve the token total")
+check(abs(c.cache_hit_rate(agg6) - 850 / 1000) < 1e-12, "cache-hit rate is exact token math")
+check(c.cache_hit_rate([0, 5, 0, 0, 0.1, 1]) is None, "no input-side tokens means no rate")
+# filter: query/state/family, empty groups dropped, no throttled state invented
+mk = lambda pid, branch, sid, model, fam, live: {"project": pid, "branch": branch, "id": sid,
+      "model": model, "fam": fam, "live": live, "val": 1.0, "agg": [0, 0, 0, 0, 1.0, 1],
+      "first": 0, "last": 0}
+fg = [{"project": "web-app", "branch": "main", "val": 2.0, "tokens": 0, "msgs": 2,
+       "first": 0, "last": 2, "live": 1, "models": ["Sonnet 5"], "share": 0.5,
+       "runs": [mk("web-app", "main", "s1", "Sonnet 5", "sonnet", True),
+                mk("web-app", "main", "s2", "Opus 4", "opus", False)]},
+      {"project": "api", "branch": "feature-x", "val": 2.0, "tokens": 0, "msgs": 2,
+       "first": 0, "last": 1, "live": 0, "models": ["Haiku 4.5"], "share": 0.5,
+       "runs": [mk("api", "feature-x", "s3", "Haiku 4.5", "haiku", False)]}]
+check(sum(len(g["runs"]) for g in c.filter_runs(fg, "web")) == 2, "query matches the project")
+check(sum(len(g["runs"]) for g in c.filter_runs(fg, "feature-x")) == 1, "query matches the branch")
+check(sum(len(g["runs"]) for g in c.filter_runs(fg, "s3")) == 1, "query matches the session id")
+check(sum(len(g["runs"]) for g in c.filter_runs(fg, "", "running")) == 1, "running keeps live runs only")
+check(sum(len(g["runs"]) for g in c.filter_runs(fg, "", "completed")) == 2, "completed keeps the rest")
+check(sum(len(g["runs"]) for g in c.filter_runs(fg, "", "all", "opus")) == 1, "family chip filters runs")
+check(c.filter_runs(fg, "nothing-matches-here") == [], "a query with no hits drops every group")
+# headroom tiers: advice only, never a model ban
+check(c.window_headroom(None)[0] == "idle", "no window means idle headroom")
+check(c.window_headroom(0)[0] == "ok" and c.window_headroom(69.9)[0] == "ok",
+      "room below 70%")
+check(c.window_headroom(70)[0] == "warn" and c.window_headroom(89.9)[0] == "warn",
+      "moderate from 70%")
+check(c.window_headroom(90)[0] == "crit" and c.window_headroom(100)[0] == "crit"
+      and c.window_headroom(140)[0] == "crit", "tight at 90%, none at 100%+")
+check(all(not any(w in t.lower() for w in ("forbid", "banned", "never use"))
+          for _, t in (c.window_headroom(p) for p in (10, 80, 95, 100))),
+      "headroom advises pacing, it bans nothing")
+# weekly emergency: weeklies at 90%+, loudest first, 5h never counts
+def _live(*items):
+    return {"status": "ok", "items": list(items)}
+check(c.weekly_emergency({"status": "off", "items": []}) is None, "no feed means no emergency")
+check(c.weekly_emergency({"status": "nobridge", "items": []}) is None, "no bridge means no emergency")
+check(c.weekly_emergency(_live({"key": "seven_day", "pct": 89.9, "label": "Week"})) is None,
+      "89.9% is not an emergency")
+check(c.weekly_emergency(_live({"key": "five_hour", "pct": 99.0, "label": "5 hours"})) is None,
+      "the 5-hour window never triggers the weekly card")
+em = c.weekly_emergency(_live({"key": "seven_day", "pct": 91.0, "label": "Week"},
+                              {"key": "seven_day_opus", "pct": 97.5, "label": "Week Opus"},
+                              {"key": "five_hour", "pct": 99.0, "label": "5 hours"}))
+check(em is not None and em["key"] == "seven_day_opus", f"loudest weekly wins ({em})")
+check(c.weekly_emergency(_live({"key": "seven_day", "pct": None, "label": "Week"})) is None,
+      "unknown pct stays silent")
+check(c.weekly_emergency(_live({"key": "seven_day_new", "pct": 93.0, "label": "Week New"}))["key"] == "seven_day_new",
+      "future weekly quota types count too")
+# 24h velocity: peak, per-message average, cache hit - all exact token math
+hrs = [{"start": 1000 + i * 3600, "fam": {}, "agg": [0, 0, 0, 0, 0.0, 0]} for i in range(24)]
+hrs[5]["agg"] = [1000, 500, 200, 800, 0.5, 4]
+hrs[20]["agg"] = [2000, 1000, 0, 4000, 1.0, 6]
+vel = c.day_velocity(hrs)
+check(vel["peak_tokens"] == 7000 and vel["peak_start"] == 1000 + 20 * 3600,
+      f"peak hour found ({vel['peak_tokens']} tok/h)")
+check(abs(vel["avg_tok_per_msg"] - 9500 / 10) < 1e-9, "avg tokens per message is exact")
+check(abs(vel["hit"] - 4800 / 8000) < 1e-12, "cache-hit rate is exact")
+nov = c.day_velocity([{"start": 1, "fam": {}, "agg": [0, 0, 0, 0, 0.0, 0]}])
+check(nov["msgs"] == 0 and nov["avg_tok_per_msg"] is None and nov["hit"] is None
+      and nov["peak_tokens"] == 0 and nov["peak_start"] is None,
+      "an empty day yields Nones, not dressed-up zeros")
+check("tok/h" in c.App.velocity_line({"hourly": hrs}) and "cache hit" in c.App.velocity_line({"hourly": hrs}),
+      "the overview pace sentence carries peak and cache hit")
 
 # formatting
 check(c.fmt_tokens(1234) == "1.2k" and c.fmt_tokens(1840000) == "1.84M" and c.fmt_tokens(312000) == "312k", "fmt_tokens")
@@ -1021,5 +1144,44 @@ trk_px = sum(1 for i in range(0, len(rgba), 4) if tuple(rgba[i:i + 3]) == track)
 frac = acc_px / float(acc_px + trk_px)
 check(0.70 <= frac <= 0.85, f"accent arc covers ~72% of the ring plus round caps ({frac:.3f})")
 check(c._rgb("#d3b787") == (0xD3, 0xB7, 0x87), "accent hex parses to RGB")
+
+# ---- v2.9.0: show-the-data-that-exists (widen hints + source notes) -----------------
+check(c.DEFAULTS["proj_range"] == "30d", "Projects defaults to a 30-day range")
+check(c.range_to_cover(0, c.HIST_RANGE_OPTS) == 7, "today's activity is covered by the 7d history range")
+check(c.range_to_cover(20, c.HIST_RANGE_OPTS) == 30, "20-day-old activity widens history to 30d")
+check(c.range_to_cover(50, c.HIST_RANGE_OPTS) == 90, "50-day-old activity widens history to 90d")
+check(c.range_to_cover(240, c.HIST_RANGE_OPTS) == 180, "activity older than 180d caps at the widest history range")
+check(c.range_to_cover(0, c.PROJ_RANGE_OPTS) == "today", "today's activity stays on the Projects Today range")
+check(c.range_to_cover(6, c.PROJ_RANGE_OPTS) == "7d", "6-day-old activity widens projects to 7d")
+check(c.range_to_cover(140, c.PROJ_RANGE_OPTS) == "180d", "140-day-old activity widens projects to 180d")
+snap_v290 = c.build_snapshot(es, now, dict(c.DEFAULTS), {}, {"roots": [], "cost_states": {}, "unpriced": {}})
+check(snap_v290["last_day"] == c.local_day(es[-1].ts),
+      "the snapshot knows the day of the newest local activity")
+check(c.App.local_note(None, {"now": now, "last_ts": now - 5 * 86400, "has_data": True})
+      == "Local Claude Code logs · last activity " + c.fmt_ago(5 * 86400),
+      "the log tabs carry a 'local logs · last activity' source line")
+check(c.App.local_note(None, {"now": now, "last_ts": None}) == "Local Claude Code logs",
+      "the source line degrades when nothing was ever logged")
+
+# ---- v2.10.0: data-scope segregation + histogram modes --------------------
+check(c.DEFAULTS["scope"] == "both", "Overview defaults to showing both data sources")
+check(c.DEFAULTS["hist_mode"] == "day", "History defaults to the per-day columns")
+_scope_p = c.CONFIG_PATH
+_sp = os.path.join(tmp, "scope-test.json")
+json.dump({"scope": "nonsense", "hist_mode": "heat"}, open(_sp, "w"))
+c.CONFIG_PATH = _sp
+_cfg10 = c.load_config()
+check(_cfg10["scope"] == "both", "an unknown overview scope falls back to 'both'")
+check(_cfg10["hist_mode"] == "day", "an unknown history mode falls back to 'day'")
+json.dump({"scope": "all", "hist_mode": "cum"}, open(_sp, "w"))
+c.CONFIG_PATH = _sp
+_cfg10b = c.load_config()
+check(_cfg10b["scope"] == "all" and _cfg10b["hist_mode"] == "cum", "valid scope and history mode are kept")
+c.CONFIG_PATH = os.path.join(tmp, "scope-roundtrip.json")
+c.save_config(dict(_cfg10b, scope="local", hist_mode="day"))
+_rt10 = c.load_config()
+check(_rt10["scope"] == "local" and _rt10["hist_mode"] == "day",
+      "scope and history mode survive a save/reload round trip")
+c.CONFIG_PATH = _scope_p
 
 print("\nFAILURES:", fails if fails else "none")

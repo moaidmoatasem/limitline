@@ -3,9 +3,17 @@
 ## Scope and window
 Everything except the live percentages comes from **this computer's Claude Code logs**. claude.ai chat, the desktop app and cloud (web) Claude Code runs write no local files, so they cannot appear as costs or projects - but the live plan percentages are Anthropic's account-wide numbers and do include them.
 
-The History window defaults to **180 days** (`history_days`, 7-180) so older projects still show. Entries are kept by their message timestamp, so a project last used months ago still counts until it ages past the window. The History and Projects tabs offer their own ranges (up to 180 days); the daily chart draws **weekly** bars at 90+ days, and the weekday x hour heatmap covers the selected range.
+The History window defaults to **180 days** (`history_days`, 7-180) so older projects still show. Entries are kept by their message timestamp, so a project last used months ago still counts until it ages past the window. The History and Projects tabs offer their own ranges (up to 180 days; Projects defaults to 30); the daily chart draws **weekly** bars at 90+ days (in Per-day mode), and the weekday x hour heatmap covers the selected range.
+
+Because the two data sources (this PC's local logs vs Anthropic's account-wide numbers) are so different, Overview has a **scope toggle**: "Claude Code" shows only the local ring against the local limit, "Claude (all)" shows only the account-wide plan figures with a note that they carry no per-day or per-project detail, and "Both" labels each number by source. The choice is a settings key (`scope`).
+
+History can also draw **Cumulative**: instead of columns it stacks each day onto a running total, so a day with no activity is a flat step - the staircase shows *when* usage happened, not just how much. Per-day mode adds value labels, a peak marker, and a 7-day rolling-average dashed trendline; both charts share a grid-spaced axis and a taller window. This matters when data is sparse: the shape of the line is the evidence, not just a total.
+
+When a range is empty only because your activity is older than it, that tab says when your newest local activity was and offers a one-click button that widens the range to cover it, instead of a dead-end "no data" message. Each log tab also shows a "Local Claude Code logs · last activity …" line, so they're visibly separate from the account-wide plan ring.
 
 Projects are named after the session's working directory: a session inside a Claude Code worktree (`<repo>/.claude/worktrees/...`) counts as the repo, and a session opened in a nested subfolder (two generic folders deep, like `ui/src`) keeps the project under the user's home directory.
+
+Branches come from the `gitBranch` field Claude Code writes on each log line - whatever it logged, capped at 80 characters, empty when it logged nothing. A session spanning messages takes its most frequent branch (ties go to the last seen). The app never shells out to git: a stale or missing branch just reads as blank, and branch names never leave the machine.
 
 ## Local logs
 Claude Code writes one JSONL file per session under `~/.claude/projects` (also `~/.config/claude/projects`, or `$CLAUDE_CONFIG_DIR`). The app reads them incrementally in a background thread: it remembers a byte offset per file, ignores a partial last line, and re-reads a file only if it shrinks or if a read failed (a locked or vanished file is retried on the next scan instead of being remembered as read).

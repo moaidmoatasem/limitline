@@ -17,7 +17,9 @@ Edit in the app (`S`) or by hand in `~/.limitline.json` while the app is closed.
 | `refresh_sec` | `15` | Local rescan interval (5 to 600) |
 | `history_days` | `180` | Days of history kept in view (7 to 180). Long by default so older projects and months still show |
 | `hist_range` | `30` | History chart span in days: `7`, `30`, `90` or `180` |
-| `proj_range` | `7d` | Projects span: `today`, `7d`, `30d`, `90d` or `180d` |
+| `hist_mode` | `day` | History chart shape: `day` (columns) or `cum` (running total) |
+| `scope` | `both` | Overview data scope: `local` (this PC's Claude Code only), `all` (account-wide only) or `both`. Affects display only - alerts always run from the full data |
+| `proj_range` | `30d` | Projects span: `today`, `7d`, `30d`, `90d` or `180d` |
 | `live_limits` | `true` | Show live plan limits (status-line file; needs Connect) |
 | `live_oauth` | `false` | Advanced and risky: also use Claude Code's saved login token. See the README's Terms and risk section |
 | `live_refresh` | `false` | With `live_oauth`: when the saved login has expired or been rejected, run `claude update` (the native CLI on PATH) once an hour to renew it, then retry once. Still opt-in |
