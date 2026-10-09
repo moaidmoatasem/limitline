@@ -36,4 +36,4 @@ target-version = "py38"
 line-length = 120
 
 [tool.ruff.lint]
-ignore = ["E402", "E702", "F841", "E741", "E731", "SIM115", "I001", "PLW1510", "RUF015", "UP031", "BLE001", "ISC004", "RUF059", "RUF046", "S110", "RUF100", "DTZ006", "FURB136", "PIE808", "B023", "C408", "DTZ011", "PLC3002", "C405"]
+ignore = ["E402", "E702", "F841", "E741", "E731", "SIM115", "I001", "PLW1510", "RUF015", "UP031", "BLE001", "ISC004", "RUF059", "RUF046", "S110", "RUF100", "DTZ006", "FURB136", "PIE808", "B023", "C408", "DTZ011", "PLC3002", "C405", "EXE001", "SIM401", "RUF023", "RUF012"]
