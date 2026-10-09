@@ -2,7 +2,12 @@
 
 Run: python tests/test_integration.py
 """
-import os, sys, json, time, tempfile, subprocess, threading, http.server
+import os
+import sys
+import json
+import time
+import tempfile
+import subprocess
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import limitline as c
 
@@ -46,9 +51,9 @@ def test_full_startup_pipeline():
     
     store = c.LogStore()
     changed, nfiles = store.scan([os.path.join(tmp, "projects")], now - 40 * 86400)
-    check(changed == 1 and nfiles == 1, f"scanned 1 file")
+    check(changed == 1 and nfiles == 1, "scanned 1 file")
     es = store.entries(now - 40 * 86400)
-    check(len(es) == 2, f"2 entries after scan")
+    check(len(es) == 2, "2 entries after scan")
     
     cfg = c.load_config(reset=True)
     snap = c.build_snapshot(es, time.time(), cfg, {"status": "off"}, {"roots": [tmp], "files": 1, "entries": 2, "demo": False})
@@ -78,7 +83,7 @@ def test_live_limits_pipeline():
                                  "seven_day": {"utilization": 14.0, "resets_at": "2026-02-12T20:00:00.123456+00:00"},
                                  "seven_day_sonnet": {"utilization": 39.0, "resets_at": "2026-02-09T14:00:00+00:00"},
                                  "extra_usage": {"is_enabled": True, "monthly_limit": 100000, "used_credits": 2500.0}})
-    check(len(items) == 3, f"3 live items parsed")
+    check(len(items) == 3, "3 live items parsed")
     check(extra is not None and abs(extra["pct"] - 2.5) < 1e-9, "extra usage parsed")
     
     # Build snapshot with live data

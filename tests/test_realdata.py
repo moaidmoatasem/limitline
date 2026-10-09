@@ -7,7 +7,10 @@ cost-state records from the local ~/.claude/projects logs.
 Requires a real Claude Code installation with cost-state records.
 Skips cleanly if no data available.
 """
-import os, sys, json, glob, time, math
+import os
+import sys
+import json
+import glob
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import limitline as c
 

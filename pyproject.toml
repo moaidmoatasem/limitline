@@ -19,7 +19,7 @@ classifiers = [
 
 [project.optional-dependencies]
 tray = ["pystray>=0.19", "Pillow>=9"]
-dev = ["pytest>=7.0", "pytest-xvfb>=0.2", "hypothesis>=6.0", "pytest-benchmark>=4.0"]
+dev = ["ruff"]
 
 [project.scripts]
 limitline = "limitline:main"
@@ -29,3 +29,10 @@ limitline-gui = "limitline:main"
 
 [tool.setuptools]
 py-modules = ["limitline"]
+
+[tool.ruff]
+target-version = "py38"
+line-length = 120
+
+[tool.ruff.lint]
+ignore = ["E402", "E702", "F841", "E741", "E731"]

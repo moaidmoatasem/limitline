@@ -1,5 +1,9 @@
 name: CI
 on: [push, pull_request]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -13,6 +17,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: Install dependencies
+        run: pip install ruff
+      - name: Lint with Ruff
+        run: ruff check limitline.py tests/
+      - name: Version sync check
+        run: python -c "import re, limitline; assert re.search(r'version = \"([^\"]+)\"', open('pyproject.toml').read()).group(1) == limitline.VERSION, 'Version mismatch'"
       - name: Compile
         run: python -m py_compile limitline.py
       - name: Core tests (no display needed)

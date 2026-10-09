@@ -2,7 +2,8 @@
 
 Run: python tests/test_render.py ; must end with `FAILURES: none`.
 """
-import os, sys
+import os
+import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 fails = []
@@ -207,8 +208,8 @@ while stack:
         pass
     stack.extend(wgt.winfo_children())
 joined = " | ".join(texts)
-check("person@example.com" in joined, f"limits card shows the account email")
-check("Prepaid credits EUR 55.97" in joined, f"limits card shows the normalized prepaid balance")
+check("person@example.com" in joined, "limits card shows the account email")
+check("Prepaid credits EUR 55.97" in joined, "limits card shows the normalized prepaid balance")
 
 
 def all_texts(frame):

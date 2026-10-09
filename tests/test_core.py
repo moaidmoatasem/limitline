@@ -1,4 +1,9 @@
-import json, os, sys, time, tempfile, glob, math
+import json
+import os
+import sys
+import time
+import tempfile
+import glob
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import limitline as c
 
@@ -403,7 +408,8 @@ else:
     print("   no cost-state records in this machine's logs - comparison skipped")
 
 # ---- audit regressions -------------------------------------------------------
-import threading, http.server
+import threading
+import http.server
 got = {}
 class _H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -421,7 +427,7 @@ import urllib.error
 try:
     c.http_get_json("http://127.0.0.1:%d/u" % srv_a.server_port, {"Authorization": "Bearer SECRET"}, 3)
     redirected = True
-except urllib.error.HTTPError as ex:
+except urllib.error.HTTPError:
     redirected = False
 check(not redirected and "b" not in got and got.get("a") == ["Bearer SECRET"], "login token is never sent on to a redirect target")
 srv_a.shutdown(); srv_b.shutdown()
@@ -1184,4 +1190,33 @@ check(_rt10["scope"] == "local" and _rt10["hist_mode"] == "day",
       "scope and history mode survive a save/reload round trip")
 c.CONFIG_PATH = _scope_p
 
+# ---- OAuth 401 and refresh tests ----
+lv401 = object.__new__(c.LiveLimits)
+lv401.app = type('A', (), {'cfg': dict(c.DEFAULTS, live_oauth=True, live_refresh=True)})()
+lv401._last_refresh = 0
+calls401 = []
+class _FakeErr401(c.urllib.error.HTTPError):
+    def __init__(self, code):
+        super().__init__('url', code, 'Unauthorized', {}, None)
+    def read(self): return b'{}'
+def fake_http401(url, headers):
+    calls401.append(url)
+    if len(calls401) == 1:
+        raise _FakeErr401(401)
+    return {'five_hour': {'utilization': 10.0, 'resets_at': '2099-01-01T00:00:00Z'}}
+def fake_refresh401():
+    calls401.append('refresh')
+    return True
+lv401._refresh_now = fake_refresh401
+old_http401 = c.http_get_json; old_cred401 = c.read_credentials
+c.http_get_json = fake_http401
+c.read_credentials = lambda: {"accessToken": "tok401", "expiresAt": time.time() * 1000 + 999999}
+try:
+    st401 = lv401.fetch_oauth()
+    check(calls401 == [c.USAGE_URL, 'refresh', c.USAGE_URL, c.PROFILE_URL], f"401 triggers refresh and retry ({calls401})")
+    check(st401.get('status') == 'ok', "retry succeeds")
+finally:
+    c.http_get_json = old_http401; c.read_credentials = old_cred401
+
 print("\nFAILURES:", fails if fails else "none")
+

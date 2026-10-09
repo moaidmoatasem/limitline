@@ -66,7 +66,6 @@ import random
 import re
 import shlex
 import shutil
-import socket
 import ssl
 import subprocess
 import sys
@@ -834,18 +833,22 @@ class LogStore:
         return m
 
     def scan(self, roots, since, progress=None):
-        paths = []
-        for root in roots:
-            for dp, _dirs, files in os.walk(root):
-                for fn in files:
-                    if fn.endswith(".jsonl"):
-                        paths.append(os.path.join(dp, fn))
-        changed = 0
-        for i, p in enumerate(paths):
+        entries = []
+        def _walk(path):
             try:
-                st = os.stat(p)
+                for entry in os.scandir(path):
+                    if entry.is_dir():
+                        _walk(entry.path)
+                    elif entry.name.endswith(".jsonl"):
+                        entries.append((entry.path, entry.stat()))
             except OSError:
-                continue
+                pass
+        for root in roots:
+            _walk(root)
+
+        changed = 0
+        total = len(entries)
+        for i, (p, st) in enumerate(entries):
             if st.st_mtime < since:
                 continue
             rec = self.files.get(p)
@@ -860,11 +863,11 @@ class LogStore:
             self.files[p] = [st.st_size, st.st_mtime, pos]
             changed += 1
             if progress and changed % 20 == 0:
-                progress(i, len(paths))
+                progress(i, total)
         if time.time() - self._pruned > 3600:
             self._pruned = time.time()
             self.by_key = {k: e for k, e in self.by_key.items() if e.ts >= since}
-        return changed, len(paths)
+        return changed, total
 
     def _read(self, path, start):
         pos = start
@@ -6482,15 +6485,29 @@ def run_selftest(args):
     check("launch-at-login entry (written then removed)", autostart)
 
     def lock():
-        s1 = socket.socket()
+        lock_path = CONFIG_PATH.replace(".json", ".lock")
+        fp = open(lock_path, "a")
+        locked = False
         try:
-            s1.bind(("127.0.0.1", INSTANCE_PORT))
-            return True, f"port {INSTANCE_PORT} free"
+            if IS_WIN:
+                import msvcrt
+                msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+            return True, "lock file free"
         except OSError:
-            return True, f"port {INSTANCE_PORT} in use (another copy is running; that is fine)"
+            return True, "lock file in use (another copy is running; that is fine)"
         finally:
-            s1.close()
-    check("single-instance port", lock)
+            if locked and IS_WIN:
+                try:
+                    import msvcrt
+                    msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            fp.close()
+    check("single-instance lock", lock)
 
     def notify():
         notify_desktop("Limitline self-test", "If you can see this notification, alerts work.")
@@ -6698,18 +6715,24 @@ def main():
     global _LOCK
     lock = None
     if not (args.multi or args.demo):
-        lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        lock_path = CONFIG_PATH.replace(".json", ".lock")
+        fp = open(lock_path, "a")
         tries = 40 if os.environ.pop("LIMITLINE_RESTART", None) else 1
         for i in range(tries):
             try:
-                lock.bind(("127.0.0.1", INSTANCE_PORT))
+                if IS_WIN:
+                    import msvcrt
+                    msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except OSError:
                 if i == tries - 1:
                     print(f"{APP_NAME} is already running (use --multi to start another).", file=sys.stderr)
                     sys.exit(0)
                 time.sleep(0.25)
-        _LOCK = lock
+        _LOCK = fp
 
     if IS_WIN:
         try:

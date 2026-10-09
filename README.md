@@ -10,13 +10,14 @@ One Python file. No dependencies beyond the standard library (tkinter) - the opt
 
 ## Features
 
-- **Live plan limits** from Claude Code's own documented status-line feature: your 5-hour and weekly percentages and reset times, with **no login or token access**. One-time connect: `python limitline.py --install-statusline` (or Settings > Connect). An opt-in advanced mode that uses the saved login is available but off by default, see [Terms and risk](#terms-and-risk).
-- **Pace awareness**: a white marker on each limit bar shows how much of the period has elapsed; the bar changes to "Ahead of pace" when you're using it faster than the clock. Burn rate ($/h, tokens/min), projection at reset, and an ETA to the limit.
-- **Four tabs**: Overview (ring gauge with a headroom row, weekly emergency card at 90%+, today / 7d / 30d, last 24 hours by model with a pace sentence, live and recent runs cross-linking to Sessions, and a **Claude Code / Claude (all) / Both data-scope toggle** that separates this PC's logs from Anthropic's account-wide numbers), History (daily or **cumulative running-total chart** with a 7-day average trendline - weekly bars at 90+ days - weekday x hour heatmap, recent 5-hour windows), Projects, Sessions (runs grouped by **project + git branch** with a KPI strip, live filter, spend-concentration badges and a read-only inspector with token legs, cache-hit rate and group export).
-- **Alerts**: banner, border flash and desktop notification at thresholds you pick (default 75% and 90%), a heads-up when a full window resets, optional pace-only mode, and shell-command hooks.
+- **Privacy-First & Local:** Limitline is designed to be purely local. It does not send analytics or telemetry. The **Live plan limits** run via Claude Code's official status-line feature, receiving only your usage percentages and reset times with **no login or token access**. Connect it once: `python limitline.py --install-statusline`.
+- **Pace Awareness:** An intuitive white marker on each limit bar tracks time elapsed. When your usage outpaces the clock, the bar warns you that you are "Ahead of pace". It includes precise burn rates ($/h, tokens/min) and headroom forecasts to prevent sudden lockouts.
+- **Local Session Insights:** Analyze your runs across four rich tabs. Explore daily and cumulative history, visualize spend-concentration across projects and git branches, and inspect cache-hit rates locally without uploading your logs. Includes a toggle to switch between local machine activity and account-wide API totals.
+- **Alerts:** Get banner flashes, desktop notifications, and even shell-command triggers at your chosen thresholds (e.g. 75% and 90%). Respects your working hours with customizable "Quiet hours" and a Snooze button.
 - **Mini pill** mode, dark and light themes, accents (the window/taskbar icon follows your accent; the Start-menu shortcut gets the same mark), opacity, always-on-top, launch at login.
-- **Multi-account**: run several copies with `--config-dir`.
-- **CSV export**, single-instance lock, `--demo` mode with sample data.
+- **Advanced (Optional) Mode:** An opt-in OAuth mode to view API headroom without using the status-line integration. Defaults to off.
+- **Multi-account:** run several copies with `--config-dir`.
+- **CSV export**, cross-platform single-instance lock, `--demo` mode with sample data.
 
 | History | Sessions |
 |---|---|
