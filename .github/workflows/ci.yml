@@ -22,16 +22,21 @@ jobs:
       - name: Lint with Ruff
         run: ruff check limitline.py tests/
       - name: Version sync check
-        run: python -c "import re, limitline; assert re.search(r'version = \"([^\"]+)\"', open('pyproject.toml').read()).group(1) == limitline.VERSION, 'Version mismatch'"
+        run: python -c "import tomllib, limitline; data = tomllib.load(open('pyproject.toml', 'rb')); assert data['project']['version'] == limitline.VERSION, f\"Version mismatch: pyproject.toml={data['project']['version']} vs limitline.py={limitline.VERSION}\""
       - name: Compile
         run: python -m py_compile limitline.py
       - name: Core tests (no display needed)
         run: python tests/test_core.py
       - name: Self-test with a real window (Windows, macOS)
         if: runner.os != 'Linux'
+        timeout-minutes: 5
         run: python limitline.py --selftest
       - name: Self-test with a virtual display (Linux)
         if: runner.os == 'Linux'
+        timeout-minutes: 5
         run: |
-          sudo apt-get update && sudo apt-get install -y python3-tk xvfb
+          sudo apt-get update && sudo apt-get install -y python3-tk xvfb libgl1-mesa-glx
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1024x768x24 &
+          sleep 3
           xvfb-run -a python limitline.py --selftest

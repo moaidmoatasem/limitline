@@ -19,6 +19,7 @@ classifiers = [
 
 [project.optional-dependencies]
 tray = ["pystray>=0.19", "Pillow>=9"]
+demo = ["mss>=7.0", "numpy>=1.24"]
 dev = ["ruff"]
 
 [project.scripts]
