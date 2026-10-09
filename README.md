@@ -8,6 +8,10 @@ One Python file. No dependencies beyond the standard library (tkinter) - the opt
 
 ![Overview](docs/img/overview.png)
 
+**Demo** - Overview, History, Projects, Sessions (sample data):
+
+![Demo](docs/img/demo.gif)
+
 ## Features
 
 - **Privacy-First & Local:** Limitline is designed to be purely local. It does not send analytics or telemetry. The **Live plan limits** run via Claude Code's official status-line feature, receiving only your usage percentages and reset times with **no login or token access**. Connect it once: `python limitline.py --install-statusline`.
