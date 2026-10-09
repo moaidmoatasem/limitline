@@ -1218,5 +1218,27 @@ try:
 finally:
     c.http_get_json = old_http401; c.read_credentials = old_cred401
 
+# ---- OAuth 403 (no refresh attempted) ----
+lv403 = object.__new__(c.LiveLimits)
+lv403.app = type('A', (), {'cfg': dict(c.DEFAULTS, live_oauth=True, live_refresh=True)})()
+lv403._last_refresh = 0
+calls403 = []
+def fake_http403(url, headers):
+    calls403.append(url)
+    raise _FakeErr401(403)
+def no_refresh403():
+    calls403.append('refresh')
+    return False  # refresh fails → no retry
+lv403._refresh_now = no_refresh403
+old_http403 = c.http_get_json; old_cred403 = c.read_credentials
+c.http_get_json = fake_http403
+c.read_credentials = lambda: {"accessToken": "tok403", "expiresAt": time.time() * 1000 + 999999}
+try:
+    st403 = lv403.fetch_oauth()
+    check(st403.get('status') == 'auth', f"403 with failed refresh returns auth status ({st403.get('status')})")
+    check('refresh' not in calls403 or calls403.count('refresh') <= 1, "403 does not loop on refresh")
+finally:
+    c.http_get_json = old_http403; c.read_credentials = old_cred403
+
 print("\nFAILURES:", fails if fails else "none")
 
